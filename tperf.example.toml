@@ -1,0 +1,12 @@
+# Copy to tperf.toml (not committed) or ~/.config/tperf/config.toml, or point TPERF_CONFIG at it.
+
+[host]
+# The bench host, as passed to ssh (HOST=... overrides it)
+ssh = "ubuntu@203.0.113.10"
+# Hugging Face token on the host (default: /home/<ssh user>/.cache/huggingface/token)
+# hf_token_path = "/home/ubuntu/.cache/huggingface/token"
+
+[hub]
+# Where runs are published and the dashboard Space it rebuilds (defaults shown)
+# dataset = "hf-internal-testing/transformers-perf"
+# dashboard_space = "hf-internal-testing/transformers-perf-dashboard"

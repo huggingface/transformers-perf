@@ -1,0 +1,14 @@
+[Unit]
+Description=Benchmark latest transformers main and publish (transformers-perf)
+Wants=network-online.target nvidia-persistenced.service
+After=network-online.target nvidia-persistenced.service bench-tuning.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Environment=PYTHONPATH=/opt/bench/src
+# PUBLISH_REPO, DASHBOARD_SPACE: written by tperf deploy from tperf.toml
+EnvironmentFile=-/opt/bench/tperf.env
+ExecStart=/usr/bin/python3 -m tperf.daily.main
+TimeoutStartSec=4h
+Nice=0

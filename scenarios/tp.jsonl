@@ -1,0 +1,4 @@
+# Tensor parallelism: eager (every all-reduce launched from Python, ~50 us each on this host) and compiled
+# (static cache, CUDA graphs: ~14 us per 8 KiB all-reduce on TP2). See `tperf tp run`.
+{"attn_implementation": "sdpa"}
+{"attn_implementation": "sdpa", "compile_kwargs": {}}

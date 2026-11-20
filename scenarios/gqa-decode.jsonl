@@ -1,0 +1,5 @@
+# GQA decoding with an SDPA mask (PR #49743): the static cache (compiled) always passes a mask, so decoding
+# goes through repeat_kv on base and the folded query heads on head. Uncompiled sdpa without padding passes no
+# mask (enable_gqa path, unchanged by the PR): a control.
+{"attn_implementation": "sdpa", "compile_kwargs": {}}
+{"attn_implementation": "sdpa"}

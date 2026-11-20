@@ -1,0 +1,7 @@
+# Tensor parallelism: eager (every all-reduce launched from Python, ~50 us each on this host) and compiled
+# (static cache, CUDA graphs: ~14 us per 8 KiB all-reduce on TP2), and compiled with the opt-in guard filter that skips
+# the guards on built-in nn modules (patches/guard-filter-scenarios.patch, not part of the
+# permanent bench). One-off A/B for PR #50964.
+{"attn_implementation": "sdpa"}
+{"attn_implementation": "sdpa", "compile_kwargs": {}}
+{"attn_implementation": "sdpa", "compile_kwargs": {"guard_filter_fn": "skip_guard_on_inbuilt_nn_modules_unsafe"}}

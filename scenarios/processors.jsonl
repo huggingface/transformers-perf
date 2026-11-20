@@ -1,0 +1,14 @@
+# Multimodal processors (tperf.processors.bench): one checkpoint per processor family, both image backends.
+{"model": "Qwen/Qwen2.5-VL-7B-Instruct", "inputs": "images-mixed", "batch": 8, "backend": "torchvision"}
+{"model": "Qwen/Qwen2.5-VL-7B-Instruct", "inputs": "images-mixed", "batch": 8, "backend": "pil"}
+{"model": "llava-hf/llava-onevision-qwen2-7b-ov-hf", "inputs": "images-mixed", "batch": 8, "backend": "torchvision"}
+{"model": "llava-hf/llava-onevision-qwen2-7b-ov-hf", "inputs": "images-mixed", "batch": 8, "backend": "pil"}
+{"model": "llava-hf/llava-onevision-qwen2-7b-ov-hf", "inputs": "video-16f", "batch": 2}
+{"model": "openai/whisper-large-v3", "inputs": "audio-30s", "batch": 8}
+# Encoders (GPU, bf16; the language model or decoder stays on CPU) on the processed inputs, and processor + encoder
+# as one call. 8 threads only: the GPU does the work. Each checkpoint is loaded once per run (scenarios grouped)
+{"model": "Qwen/Qwen2.5-VL-7B-Instruct", "inputs": "images-mixed", "batch": 8, "backend": "torchvision", "stage": "encoder", "threads": 8}
+{"model": "Qwen/Qwen2.5-VL-7B-Instruct", "inputs": "images-mixed", "batch": 8, "backend": "torchvision", "stage": "both", "threads": 8}
+{"model": "llava-hf/llava-onevision-qwen2-7b-ov-hf", "inputs": "images-mixed", "batch": 8, "backend": "torchvision", "stage": "encoder", "threads": 8}
+{"model": "llava-hf/llava-onevision-qwen2-7b-ov-hf", "inputs": "video-16f", "batch": 2, "stage": "encoder", "threads": 8}
+{"model": "openai/whisper-large-v3", "inputs": "audio-30s", "batch": 8, "stage": "encoder", "threads": 8}

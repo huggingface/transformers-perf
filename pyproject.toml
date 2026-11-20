@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "transformers-perf"
+version = "0.1.0"
+description = "Performance tracking for transformers on a dedicated GPU host"
+readme = "README.md"
+requires-python = ">=3.11"
+# The workstation side (ssh, rsync, git) and the host's system-python modules need only the standard library
+dependencies = []
+
+[project.optional-dependencies]
+# tperf dashboard build (also tperf.ab.compare on the host)
+dashboard = ["huggingface_hub", "pyarrow"]
+# What the host-side modules import in the bench host's venvs (installed there by `tperf host install`)
+host = ["huggingface_hub", "numpy", "nvidia-ml-py", "pillow", "pyarrow", "torch", "transformers"]
+
+[project.scripts]
+tperf = "tperf.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tperf"]  # with its data files: daily/bench-daily.{service,timer}, dashboard/template.html
+
+[tool.ruff]
+line-length = 119
+target-version = "py311"
+extend-exclude = ["results"]
+
+[tool.pytest.ini_options]
+testpaths = ["harness/tests"]
+pythonpath = ["."]

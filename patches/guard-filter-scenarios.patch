@@ -1,0 +1,126 @@
+diff --git a/harness/framework/benchmark_config.py b/harness/framework/benchmark_config.py
+index 7ee2394fd0..265fe797d5 100644
+--- a/harness/framework/benchmark_config.py
++++ b/harness/framework/benchmark_config.py
+@@ -55,6 +55,25 @@ def is_fa2_or_kernel_available() -> bool:
+     return True
+ 
+ 
++def make_compile_config(compile_kwargs: dict[str, Any], guard_filter: str | None) -> CompileConfig:
++    """`CompileConfig(**compile_kwargs)`, with the guard filter `torch.compiler.<guard_filter>` if one is named.
++
++    `CompileConfig` takes `guard_filter_fn` since #50964. On an older transformers, the filter goes through
++    `torch.compile`'s `options` instead, which excludes `mode`: the mode is expanded into its inductor options. Both
++    sides of an A/B then run the same scenario."""
++    if guard_filter is None:
++        return CompileConfig(**compile_kwargs)
++    fn = getattr(torch.compiler, guard_filter)
++    if "guard_filter_fn" in getattr(CompileConfig, "__dataclass_fields__", {}):
++        return CompileConfig(**compile_kwargs, guard_filter_fn=fn)
++    from torch._inductor import list_mode_options
++
++    kwargs = dict(compile_kwargs)
++    mode = kwargs.pop("mode", "reduce-overhead")
++    options = {**list_mode_options(mode, kwargs.get("dynamic")), **(kwargs.pop("options", None) or {})}
++    return CompileConfig(**kwargs, mode=None, options={**options, "guard_filter_fn": fn})
++
++
+ class BenchmarkConfig:
+     """Configuration for a single benchmark scenario."""
+ 
+@@ -90,11 +109,19 @@ class BenchmarkConfig:
+         self.attn_implementation = attn_implementation
+         self.tp_plan = tp_plan
+         # Optimization parameters
++        self.guard_filter = self.compile_mode = None
+         if compile_kwargs is None:
+             self.compile_config = None
+         else:
++            compile_kwargs = dict(compile_kwargs)
+             compile_kwargs["fullgraph"] = compile_kwargs.get("fullgraph", True)
+-            self.compile_config = CompileConfig(**compile_kwargs)
++            # A guard filter is named in JSON scenarios, e.g. "skip_guard_on_inbuilt_nn_modules_unsafe"
++            options = dict(compile_kwargs.get("options") or {})
++            self.guard_filter = compile_kwargs.pop("guard_filter_fn", None) or options.pop("guard_filter_fn", None)
++            if options or "options" in compile_kwargs:
++                compile_kwargs["options"] = options or None
++            self.compile_mode = compile_kwargs.get("mode", "reduce-overhead")
++            self.compile_config = make_compile_config(compile_kwargs, self.guard_filter)
+         self.kernelize = kernelize
+         # Constant parameters
+         self.dtype = "torch.bfloat16"
+@@ -160,6 +187,15 @@ class BenchmarkConfig:
+         # `DistributedConfig.tp_plan` only takes an explicit plan; leaving it as None makes it use the model's own.
+         return DistributedConfig(tp_size=tp_size, tp_plan=self.tp_plan if isinstance(self.tp_plan, dict) else None)
+ 
++    def compile_kwargs_dict(self) -> dict[str, Any] | None:
++        """The compile kwargs for JSON, as in the scenario file: the guard filter by name, and the mode."""
++        if self.compile_config is None:
++            return None
++        kwargs = {k: v for k, v in self.compile_config.to_dict().items() if k != "guard_filter_fn"}
++        if self.guard_filter is not None:
++            kwargs.update(mode=self.compile_mode, options=None, guard_filter_fn=self.guard_filter)
++        return kwargs
++
+     def infer_name(self, compact: bool = True) -> str:
+         """Infer a human-readable name for the benchmark config, either compact or verbose."""
+         if compact:
+@@ -167,7 +203,9 @@ class BenchmarkConfig:
+             gpu_monitor_str = "monitored" if self.gpu_monitoring else "unmonitored"
+             dimensions_str = f"b{self.batch_size}_s{self.sequence_length}_n{self.num_tokens_to_generate}"
+             attn_code = self.attn_implementation
+-            compile_str = f"compiled_{self.compile_config.mode}" if self.compile_config is not None else "uncompiled"
++            compile_str = f"compiled_{self.compile_mode}" if self.compile_config is not None else "uncompiled"
++            if self.guard_filter:
++                compile_str += "_guard_filter"
+             kernelize_str = "kernelized" if self.kernelize else "unkernelized"
+             continuous_batching_str = "cb" if self.continuous_batching else "generate"
+             tp_str = "tp" if self.tp_plan is not None else "no_tp"
+@@ -178,6 +216,8 @@ class BenchmarkConfig:
+             dimensions_str = f"batch size {self.batch_size}, sequence length {self.sequence_length}, {self.num_tokens_to_generate} generated tokens"
+             attn_code = f"{self.attn_implementation} attention"
+             compile_str = "compiled" if self.compile_config is not None else "not compiled"
++            if self.guard_filter:
++                compile_str += f" with guard filter {self.guard_filter}"
+             kernelize_str = "kernelized" if self.kernelize else "not kernelized"
+             continuous_batching_str = "continuous batching" if self.continuous_batching else "regular generate"
+             if self.tp_plan is None:
+@@ -213,7 +253,7 @@ class BenchmarkConfig:
+             "sequence_length": self.sequence_length,
+             "num_tokens_to_generate": self.num_tokens_to_generate,
+             "attn_implementation": self.attn_implementation,
+-            "compile_kwargs": self.compile_config.to_dict() if self.compile_config is not None else None,
++            "compile_kwargs": self.compile_kwargs_dict(),
+             "kernelize": self.kernelize,
+             "tp_plan": self.tp_plan,
+         }
+diff --git a/harness/framework/benchmark_runner.py b/harness/framework/benchmark_runner.py
+index 23600cf48d..74202671ed 100644
+--- a/harness/framework/benchmark_runner.py
++++ b/harness/framework/benchmark_runner.py
+@@ -208,9 +208,14 @@ class BenchmarkRunner:
+             "max_new_tokens": config.num_tokens_to_generate,
+         }
+ 
+-        # Add compile config if found
+-        if config.compile_config is not None:
++        # Add compile config if found. A guard filter on a transformers without `CompileConfig.guard_filter_fn` sits in
++        # `options`, which its GenerationConfig can't print: the compile config is then set after loading.
++        late_compile_config = None
++        if config.compile_config is not None and "guard_filter_fn" in (config.compile_config.options or {}):
++            late_compile_config = config.compile_config
++        elif config.compile_config is not None:
+             generation_config_kwargs.update(compile_config=config.compile_config)
++        if config.compile_config is not None:
+             # To trigger compile in generate, we need to set the cache to static
+             if not config.continuous_batching:
+                 generation_config_kwargs.update(cache_implementation="static")
+@@ -256,6 +261,8 @@ class BenchmarkRunner:
+             "manager_warmup": True if config.continuous_batching else None,
+         }
+         self.logger.info(f"Execution settings: {self.execution_settings}")
++        if late_compile_config is not None:
++            self.model.generation_config.compile_config = late_compile_config
+ 
+     def run_benchmark(self, config: BenchmarkConfig, num_tokens_to_profile: int = 0) -> BenchmarkResult | None:
+         """Run a single benchmark with the given model ID and config."""

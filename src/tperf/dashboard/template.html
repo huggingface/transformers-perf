@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10);
+  --series-1: #2a78d6; --band-1: rgba(42,120,214,0.16);
+  --good: #0ca30c; --good-text: #006300; --warning: #fab219; --critical: #d03b3b; --neutral: #f0efec;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+    --series-1: #3987e5; --band-1: rgba(57,135,229,0.22);
+    --good-text: #0ca30c; --neutral: #383835;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+  --series-1: #3987e5; --band-1: rgba(57,135,229,0.22);
+  --good-text: #0ca30c; --neutral: #383835;
+}
+* { box-sizing: border-box; }
+body { margin: 0; overflow-wrap: anywhere; background: var(--page); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1240px; margin: 0 auto; padding: 24px 16px 64px; }
+h1 { font-size: 22px; margin: 0 0 4px; }
+h2 { font-size: 17px; margin: 36px 0 4px; }
+.panel { background: var(--neutral); border: 1px solid var(--border); border-radius: 14px; padding: 14px 14px 16px; margin: 0 0 18px; scroll-margin-top: 56px; }
+.panel > h3 { font-size: 15px; margin: 0 0 12px; display: flex; gap: 8px; align-items: baseline; }
+.panel > h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
+.panel > h3 { flex-wrap: wrap; }
+.panel-filter { margin-left: auto; color: var(--ink-2); font-size: 13px; font-weight: 400; display: flex; gap: 6px; align-items: center; }
+.menu { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 0; margin: 0 0 10px; background: var(--page); }
+.menu a { font-size: 13px; color: var(--ink-2); text-decoration: none; border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px; background: var(--surface); }
+.menu a:hover { color: var(--ink); border-color: var(--axis); }
+.sources { font-size: 12px; color: var(--ink-2); margin: 4px 0 0; padding-left: 18px; }
+.sub, .note { color: var(--ink-2); margin: 0; }
+.note { font-size: 13px; margin-bottom: 14px; }
+.filters { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin: 18px 0 8px; }
+.filters label { color: var(--ink-2); font-size: 13px; display: flex; gap: 6px; align-items: center; }
+select { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr)); gap: 14px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 14px 10px; min-width: 0; }
+.card h3 { font-size: 14px; margin: 0; font-weight: 600; }
+.card .meta { color: var(--muted); font-size: 12px; margin: 2px 0 8px; }
+.headline { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.headline .v { font-size: 20px; font-weight: 600; }
+.delta { font-size: 13px; color: var(--ink-2); }
+.delta.worse { color: var(--critical); } .delta.better { color: var(--good-text); }
+svg { display: block; width: 100%; overflow: visible; }
+svg text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.tip { position: fixed; pointer-events: none; background: var(--surface); color: var(--ink); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.12); max-width: 320px; display: none; z-index: 10; }
+.tip strong { font-size: 14px; font-variant-numeric: tabular-nums; }
+.tip .k { display: inline-block; width: 14px; height: 2px; background: var(--series-1); vertical-align: middle; margin-right: 6px; }
+.tip .m { color: var(--ink-2); }
+details { margin-top: 6px; } summary { cursor: pointer; color: var(--ink-2); font-size: 12px; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums; }
+th, td { overflow-wrap: normal; text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--grid); vertical-align: top; white-space: nowrap; }
+th { color: var(--ink-2); font-weight: 600; }
+td.wrap { white-space: normal; min-width: 180px; }
+.chip { display: inline-flex; gap: 4px; align-items: center; font-size: 11px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border); color: var(--ink-2); margin-top: 2px; }
+.chip i { font-style: normal; width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.chip.regression i { background: var(--critical); } .chip.improvement i { background: var(--good); }
+.chip.inconclusive i { background: var(--warning); } .chip.same i { background: var(--axis); }
+.chg { font-weight: 600; } .ci { color: var(--muted); }
+.ab { margin-bottom: 14px; }
+.ab h3 a { color: inherit; }
+.empty { color: var(--ink-2); background: var(--surface); border: 1px dashed var(--border); border-radius: 10px; padding: 18px; }
+.counters { color: var(--ink-2); font-size: 12px; margin-top: 6px; }
+nav { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 13px; margin-bottom: 18px; }
+nav a { color: var(--ink-2); text-decoration: none; } nav a:hover { text-decoration: underline; }
+nav a[aria-current] { color: var(--ink); font-weight: 600; }
+a { color: var(--series-1); }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <nav id="nav"></nav>
+  <h1 id="title"></h1>
+  <p class="sub" id="sub"></p>
+
+  <section id="overview" hidden>
+    <h2>main</h2>
+    <div id="main-summary"></div>
+    <h2>Pull requests</h2>
+    <p class="note">Each PR runs side by side against the commit it is based on (for a merged PR, main right before the merge). Verdicts are from its latest run.</p>
+    <div id="prs"></div>
+  </section>
+
+  <section id="main-page" hidden>
+  <h2>Series</h2>
+  <p class="note" id="series-note">Latest main every day at 03:00 UTC, 3 runs. The line is the median of the runs' medians; the band spans the runs' medians (min–max). Generation: harness on one GPU. Multimodal processors: tperf.processors.bench turns a fixed batch of images, videos or audio into model inputs on 8 pinned CPU cores, 5 timed calls per run. Multimodal encoders: the model's vision or audio encoder on those inputs (GPU, bf16), with its GPU→CPU syncs per call: each one stalls the CPU until the GPU catches up, which in a serving engine breaks the overlap of the encoder with the rest of the step.</p>
+  <p class="note">Only what runs every day is shown: a scenario that failed, or a metric that was not recorded, in any of the last 7 daily runs is left out until it has a clean week.</p>
+  <div class="filters">
+    <label id="metric-label" class="panel-filter">Metric <select id="metric"></select></label>
+    <label>Model <select id="model"></select></label>
+  </div>
+  <div class="menu" id="menu"></div>
+  <div id="series"></div>
+  </section>
+
+  <section id="ab-page" hidden>
+  <h2>Side-by-side runs</h2>
+  <p class="note">Both sides run at the same time on two GPUs that swap every round; change is the PR's effect with the GPU difference fitted out, with a 95% CI over rounds. Positive = the PR is worse (slower, or less throughput). Verdict threshold: 1%.</p>
+  <div id="abs"></div>
+  </section>
+</main>
+<div class="tip" id="tip" role="status"></div>
+
+<script id="data" type="application/json">__DATA__</script>
+<script>
+(() => {
+const D = JSON.parse(document.getElementById("data").textContent);
+const $ = (id) => document.getElementById(id);
+const el = (tag, attrs = {}, text) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  if (text !== undefined) e.textContent = text;
+  return e;
+};
+const svgEl = (tag, attrs = {}) => {
+  const e = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  return e;
+};
+const fmt = (v, unit) => {
+  if (v == null) return "–";
+  if (unit === "syncs") return String(Math.round(v));
+  if (unit === "ms" && v >= 10000) return (v / 1000).toFixed(1) + " s";
+  const d = Math.abs(v) >= 100 ? 1 : Math.abs(v) >= 10 ? 2 : 3;
+  return v.toFixed(d) + " " + unit;
+};
+const pct = (v) => (v >= 0 ? "+" : "") + v.toFixed(2) + "%";
+const day = (iso) => iso.slice(0, 10);
+const store = { get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+                set(k, v) { try { localStorage.setItem(k, v); } catch {} } };
+
+const P = D.page;
+
+// ---------- links ----------
+// On huggingface.co the Space runs in an iframe, so the address bar never changes as pages change. Every page puts
+// its state in ?page=<name>&... and sends it to the parent page, which mirrors it in its own URL, and the parent
+// passes its query string to the iframe when a link is opened: index.html then routes to that page.
+const params = new URLSearchParams(location.search);
+const wanted = params.get("page");
+if (wanted && wanted + ".html" !== P.file && D.files.includes(wanted + ".html")) {
+  location.replace(wanted + ".html" + location.search + location.hash);
+  return;
+}
+function syncUrl(extra = {}) {
+  const q = new URLSearchParams({ page: P.file.replace(/\.html$/, "") });
+  for (const [k, v] of Object.entries(extra)) if (v) q.set(k, v);
+  const qs = "?" + q.toString();
+  try { history.replaceState(null, "", qs + location.hash); } catch {}
+  if (window.parent !== window) window.parent.postMessage({ queryString: qs, hash: location.hash }, "https://huggingface.co");
+}
+$("title").textContent = P.heading;
+$("sub").textContent = `${D.host} · updated ${D.generated_at.replace("T", " ")} UTC`;
+for (const [href, label] of [["index.html", "Overview"], ["main.html", "main"]].concat(P.kind === "ab" ? [[P.file, P.nav]] : [])) {
+  const a = el("a", { href }, label); if (href === P.file) a.setAttribute("aria-current", "page"); $("nav").append(a);
+}
+for (const [href, label] of [[P.link, "on GitHub"], [P.ci_link, "CI test results"]]) {
+  if (href) { $("sub").append(" · "); $("sub").append(el("a", { href, target: "_blank", rel: "noopener" }, label)); }
+}
+$(P.kind === "index" ? "overview" : P.kind === "main" ? "main-page" : "ab-page").hidden = false;
+
+// ---------- filters ----------
+const metricSel = $("metric"), modelSel = $("model"), metricLabel = $("metric-label");
+if (P.kind === "main") {
+for (const [k, m] of Object.entries(D.metrics)) metricSel.append(el("option", { value: k }, m.label));
+modelSel.append(el("option", { value: "" }, "All"));
+for (const m of [...new Set(D.series.map((s) => s.model))]) modelSel.append(el("option", { value: m }, m));
+const pick = (sel, v) => (v != null && [...sel.options].some((o) => o.value === v) ? v : null);
+metricSel.value = pick(metricSel, params.get("metric")) ?? pick(metricSel, store.get("metric")) ?? metricSel.options[0]?.value ?? "";
+modelSel.value = pick(modelSel, params.get("model")) ?? pick(modelSel, store.get("model")) ?? "";
+const syncFilters = () => syncUrl({ metric: metricSel.value, model: modelSel.value });
+metricSel.onchange = () => { store.set("metric", metricSel.value); syncFilters(); renderSeries(); };
+modelSel.onchange = () => { store.set("model", modelSel.value); syncFilters(); renderSeries(); };
+syncFilters();
+} else syncUrl();
+
+// ---------- tooltip ----------
+const tip = $("tip");
+function showTip(evt, build) {
+  tip.replaceChildren(); build(tip); tip.style.display = "block";
+  const r = tip.getBoundingClientRect();
+  let x = evt.clientX + 14, y = evt.clientY + 14;
+  if (x + r.width > innerWidth - 8) x = evt.clientX - r.width - 14;
+  if (y + r.height > innerHeight - 8) y = evt.clientY - r.height - 14;
+  tip.style.left = x + "px"; tip.style.top = y + "px";
+}
+const hideTip = () => { tip.style.display = "none"; };
+
+// ---------- main series ----------
+function chart(points, metric, unit) {
+  const pts = points.map((p, i) => ({ p, i, v: p.values[metric] })).filter((d) => d.v);
+  const W = 340, H = 150, L = 52, R = 10, T = 8, B = 22;
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, role: "img" });
+  if (!pts.length) { const t = svgEl("text", { x: L, y: H / 2 }); t.textContent = "no data for this metric"; svg.append(t); return svg; }
+  let lo = Math.min(...pts.map((d) => d.v[1])), hi = Math.max(...pts.map((d) => d.v[2]));
+  const pad = (hi - lo) * 0.15 || Math.abs(hi) * 0.01 || 1; lo -= pad; hi += pad;
+  const n = pts.length;
+  const x = (i) => n === 1 ? (L + W - R) / 2 : L + (i / (n - 1)) * (W - L - R);
+  const y = (v) => T + (1 - (v - lo) / (hi - lo)) * (H - T - B);
+  for (let k = 0; k <= 3; k++) {
+    const v = lo + (k / 3) * (hi - lo), yy = y(v);
+    svg.append(svgEl("line", { x1: L, x2: W - R, y1: yy, y2: yy, stroke: "var(--grid)", "stroke-width": 1 }));
+    const t = svgEl("text", { x: L - 6, y: yy + 4, "text-anchor": "end" }); t.textContent = fmt(v, unit).replace(" ", " "); svg.append(t);
+  }
+  svg.append(svgEl("line", { x1: L, x2: W - R, y1: H - B, y2: H - B, stroke: "var(--axis)", "stroke-width": 1 }));
+  const first = svgEl("text", { x: x(0), y: H - 6, "text-anchor": n === 1 ? "middle" : "start" }); first.textContent = day(pts[0].p.date); svg.append(first);
+  if (n > 1) { const last = svgEl("text", { x: x(n - 1), y: H - 6, "text-anchor": "end" }); last.textContent = day(pts[n - 1].p.date); svg.append(last); }
+  if (n > 1) {
+    const band = pts.map((d, i) => `${x(i)},${y(d.v[2])}`).concat(pts.slice().reverse().map((d, j) => `${x(n - 1 - j)},${y(d.v[1])}`));
+    svg.append(svgEl("polygon", { points: band.join(" "), fill: "var(--band-1)" }));
+    svg.append(svgEl("polyline", { points: pts.map((d, i) => `${x(i)},${y(d.v[0])}`).join(" "), fill: "none", stroke: "var(--series-1)", "stroke-width": 2, "stroke-linejoin": "round" }));
+  } else {
+    svg.append(svgEl("line", { x1: x(0), x2: x(0), y1: y(pts[0].v[1]), y2: y(pts[0].v[2]), stroke: "var(--band-1)", "stroke-width": 8, "stroke-linecap": "round" }));
+  }
+  if (n <= 40) for (const [i, d] of pts.entries())
+    svg.append(svgEl("circle", { cx: x(i), cy: y(d.v[0]), r: 4, fill: "var(--series-1)", stroke: "var(--surface)", "stroke-width": 2 }));
+  const cross = svgEl("line", { y1: T, y2: H - B, stroke: "var(--axis)", "stroke-width": 1, visibility: "hidden" });
+  svg.append(cross);
+  const hit = svgEl("rect", { x: L - 8, y: 0, width: W - L - R + 16, height: H, fill: "transparent", tabindex: 0 });
+  svg.append(hit);
+  const nearest = (evt) => {
+    const box = svg.getBoundingClientRect(), sx = ((evt.clientX - box.left) / box.width) * W;
+    let best = 0; for (let i = 1; i < n; i++) if (Math.abs(x(i) - sx) < Math.abs(x(best) - sx)) best = i;
+    return best;
+  };
+  const show = (evt, i) => {
+    const d = pts[i]; cross.setAttribute("x1", x(i)); cross.setAttribute("x2", x(i)); cross.setAttribute("visibility", "visible");
+    showTip(evt, (t) => {
+      t.append(el("span", { class: "k" }), el("strong", {}, fmt(d.v[0], unit)));
+      t.append(el("div", { class: "m" }, `range ${fmt(d.v[1], unit)} – ${fmt(d.v[2], unit)} · ${d.p.runs} run(s)` + (d.p.failed ? ` · ${d.p.failed} failed` : "")));
+      t.append(el("div", {}, `${day(d.p.date)} · ${d.p.commit.slice(0, 10)}`));
+      t.append(el("div", { class: "m" }, d.p.subject));
+    });
+  };
+  hit.addEventListener("pointermove", (e) => show(e, nearest(e)));
+  hit.addEventListener("pointerleave", () => { cross.setAttribute("visibility", "hidden"); hideTip(); });
+  hit.addEventListener("focus", () => { const b = hit.getBoundingClientRect(); show({ clientX: b.right, clientY: b.top }, n - 1); });
+  hit.addEventListener("blur", () => { cross.setAttribute("visibility", "hidden"); hideTip(); });
+  return svg;
+}
+
+function renderSeries() {
+  const box = $("series"); box.replaceChildren();
+  const list = D.series.filter((s) => (!modelSel.value || s.model === modelSel.value) && s.metrics.includes(s.metric || metricSel.value));
+  if (!list.length) { box.append(el("div", { class: "empty" }, "No daily runs with this metric yet. The daily run starts at 03:00 UTC.")); return; }
+  // one panel per section (Generation, processors, encoders), and a menu to jump to them
+  const menu = $("menu"); menu.replaceChildren();
+  const groups = [...new Set(list.map((s) => s.group || "Series"))];
+  const slug = (g) => "sec-" + g.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/-$/, "");
+  let grid = null, group;
+  for (const s of list) {
+    if (!grid || (s.group || "Series") !== group) {
+      group = s.group || "Series";
+      const n = list.filter((x) => (x.group || "Series") === group).length;
+      const panel = el("section", { class: "panel", id: slug(group) }), h = el("h3", {}, group);
+      h.append(el("small", {}, `${n} series` + (group === "Generation" ? "" : " · call time")));
+      if (group === "Generation") h.append(metricLabel);  // the metric picker only drives this panel
+      grid = el("div", { class: "grid" }); panel.append(h, grid); box.append(panel);
+      const a = el("a", { href: "#" + slug(group) }, group);
+      a.onclick = (e) => { e.preventDefault(); $(slug(group)).scrollIntoView({ behavior: "smooth", block: "start" }); };
+      menu.append(a);
+    }
+    const card = el("div", { class: "card" });
+    card.append(el("h3", {}, s.scenario), el("div", { class: "meta" }, `${s.model} · ${s.gpu}`));
+    // processor and encoder cards always show their own metric (call time), not the generation metric picked
+    const metric = s.metric || metricSel.value, m = s.metric ? D.series_metrics[s.metric] : D.metrics[metric];
+    const withV = s.points.filter((p) => p.values[metric]);
+    const head = el("div", { class: "headline" });
+    if (withV.length) {
+      const last = withV[withV.length - 1].values[metric][0];
+      head.append(el("span", { class: "v" }, fmt(last, m.unit)));
+      if (withV.length > 1) {
+        const prev = withV[withV.length - 2].values[metric][0], c = 100 * (last - prev) / prev;
+        const worse = m.higher_is_better ? c < 0 : c > 0;
+        const cls = Math.abs(c) < 1 ? "" : worse ? "worse" : "better";
+        head.append(el("span", { class: "delta " + cls }, `${Math.abs(c) < 1 ? "" : worse ? "▲ " : "▼ "}${pct(c)} vs previous day`));
+      }
+      const syncs = withV[withV.length - 1].values.syncs;
+      if (syncs) head.append(el("span", { class: "delta" }, `· ${fmt(syncs[0], "syncs")} GPU→CPU syncs per call`));
+    }
+    card.append(head, chart(s.points, metric, m.unit));
+    const latest = s.points[s.points.length - 1];
+    if (latest.sync_sources && Object.keys(latest.sync_sources).length) {
+      const sd = el("details"); sd.append(el("summary", {}, `Where the ${fmt(latest.values.syncs?.[0], "syncs")} syncs come from (latest run)`));
+      const ul = el("ul", { class: "sources" });
+      for (const [src, n] of Object.entries(latest.sync_sources)) ul.append(el("li", {}, `${n} × ${src}`));
+      sd.append(ul); card.append(sd);
+    }
+    const hasOut = s.points.some((p) => p.outputs), hasSyncs = s.metrics.includes("syncs");
+    const det = el("details"); det.append(el("summary", {}, "Table"));
+    const tw = el("div", { class: "scroll" }), tb = el("table"), hr = el("tr");
+    for (const h of ["Date", "Commit", "Median", "Min", "Max", "Runs"].concat(hasSyncs ? ["Syncs"] : [], hasOut ? ["Output"] : [])) hr.append(el("th", {}, h));
+    tb.append(hr);
+    const rev = s.points.slice().reverse();
+    for (const [i, p] of rev.entries()) {
+      const v = p.values[metric] || [null, null, null], tr = el("tr");
+      const cells = [day(p.date), p.commit.slice(0, 10), fmt(v[0], m.unit), fmt(v[1], m.unit), fmt(v[2], m.unit), `${p.runs}` + (p.failed ? ` (${p.failed} failed)` : "")];
+      if (hasSyncs) cells.push(fmt(p.values.syncs?.[0], "syncs"));
+      if (hasOut) {  // a processor change that alters what it returns shows as a new hash
+        const o = (p.outputs || []).map((h) => h.slice(0, 8)).join(" "), prev = rev[i + 1]?.outputs;
+        cells.push(o + (prev && JSON.stringify(prev) !== JSON.stringify(p.outputs) ? " (changed)" : ""));
+      }
+      for (const c of cells) tr.append(el("td", {}, c));
+      tb.append(tr);
+    }
+    tw.append(tb); det.append(tw); card.append(det);
+    grid.append(card);
+  }
+}
+
+// ---------- A/B ----------
+const VERDICT = (v) => v.startsWith("REGRESSION") ? ["regression", "regression"] : v.startsWith("improvement") ? ["improvement", "improvement"]
+  : v.startsWith("no change") ? ["same", "no change"] : ["inconclusive", "inconclusive"];
+const AB_METRICS = ["e2e", "ttft", "itl_h1", "itl_h2", "cold", "mem"];
+const AB_LABELS = { e2e: "e2e", ttft: "TTFT", itl: "ITL", itl_h1: "ITL 1st half", itl_h2: "ITL 2nd half", "tok/s": "tok/s", cold: "cold start", mem: "peak memory", load: "load" };
+function renderAbs() {
+  const box = $("abs");
+  if (!D.abs.length) { box.append(el("div", { class: "empty" }, "No side-by-side runs yet.")); return; }
+  for (const a of D.abs) {
+    const card = el("div", { class: "card ab" }), h = el("h3");
+    h.append(document.createTextNode(`${day(a.date)} · ${a.model}`));
+    card.append(h, el("div", { class: "meta" }, `base ${String(a.base_commit).slice(0, 10)} → head ${String(a.head_commit).slice(0, 10)} · ${a.bench_args || ""}`));
+    const present = new Set(a.scenarios.flatMap((s) => s.metrics.map((m) => m.name)));
+    const cols = AB_METRICS.filter((m) => present.has(m)).concat(present.has("itl_h1") ? [] : ["itl"].filter((m) => present.has(m)));
+    const tw = el("div", { class: "scroll" }), tb = el("table"), hr = el("tr");
+    hr.append(el("th", {}, "Scenario"), el("th", {}, "Rounds"));
+    for (const c of cols) hr.append(el("th", {}, AB_LABELS[c] || c));
+    tb.append(hr);
+    for (const s of a.scenarios) {
+      const tr = el("tr"); tr.append(el("td", { class: "wrap" }, s.scenario), el("td", {}, String(s.rounds)));
+      for (const c of cols) {
+        const m = s.metrics.find((x) => x.name === c), td = el("td");
+        if (m) {
+          td.append(el("span", { class: "chg" }, pct(m.change_pct)), el("br"),
+                    el("span", { class: "ci" }, `[${m.ci[0].toFixed(2)}, ${m.ci[1].toFixed(2)}]`), el("br"));
+          const [cls, label] = VERDICT(m.verdict), chip = el("span", { class: "chip " + cls }); chip.append(el("i"), document.createTextNode(label));
+          td.append(chip);
+          td.title = `${m.name}: ${m.base.toFixed(3)} → ${m.head.toFixed(3)} · ${m.verdict}`;
+        } else td.textContent = "–";
+        tr.append(td);
+      }
+      tb.append(tr);
+      const cg = s.counters["compiled graphs"];
+      if (cg && (cg.base !== "0/0/0" || cg.head !== "0/0/0")) {
+        const ctr = el("tr"), ctd = el("td", { colspan: cols.length + 2, class: "counters" }, `compiled graphs (first generation / warmup / measured): base ${cg.base}, head ${cg.head}`);
+        ctr.append(ctd); tb.append(ctr);
+      }
+    }
+    tw.append(tb); card.append(tw);
+    if (a.failed.length) card.append(el("div", { class: "counters" }, "Failed on at least one side: " + a.failed.join(", ")));
+    box.append(card);
+  }
+}
+// ---------- overview ----------
+function verdictChips(counts) {
+  const box = el("span", { class: "chips" });
+  for (const [cls, label] of [["regression", "regression"], ["improvement", "improvement"], ["inconclusive", "inconclusive"], ["same", "no change"]]) {
+    if (!counts[cls]) continue;
+    const chip = el("span", { class: "chip " + cls }); chip.append(el("i"), document.createTextNode(`${counts[cls]} ${label}`)); box.append(chip);
+  }
+  return box;
+}
+function renderOverview() {
+  const ms = $("main-summary"), card = el("div", { class: "card" });
+  const last = D.main.last_date;
+  card.append(el("h3", {}, "")); card.firstChild.append(el("a", { href: "main.html" }, "Daily main series"));
+  card.append(el("div", { class: "meta" }, last ? `${D.main.series} series · ${D.main.days} day(s) · latest ${day(last)} (${D.main.last_commit.slice(0, 10)})` : "No daily run yet. The first one runs at 03:00 UTC."));
+  ms.append(card);
+  const box = $("prs");
+  if (!D.prs.length) { box.append(el("div", { class: "empty" }, "No side-by-side runs yet.")); return; }
+  const tw = el("div", { class: "scroll card" }), tb = el("table"), hr = el("tr");
+  for (const h of ["PR", "Title", "Runs", "Latest", "Models", "Latest verdicts (all metrics)"]) hr.append(el("th", {}, h));
+  tb.append(hr);
+  for (const pr of D.prs) {
+    const tr = el("tr"), a = el("a", { href: pr.file }, pr.label), td0 = el("td"); td0.append(a);
+    const vt = el("td"); vt.append(verdictChips(pr.verdicts));
+    tr.append(td0, el("td", { class: "wrap" }, pr.title || ""), el("td", {}, String(pr.runs)), el("td", {}, day(pr.last_date)), el("td", { class: "wrap" }, pr.models.join(", ")), vt);
+    tb.append(tr);
+  }
+  tw.append(tb); box.append(tw);
+}
+if (P.kind === "index") renderOverview();
+if (P.kind === "main") renderSeries();
+if (P.kind === "ab") renderAbs();
+})();
+</script>
+</body>
+</html>

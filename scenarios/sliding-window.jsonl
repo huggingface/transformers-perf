@@ -1,0 +1,4 @@
+# Scenarios for sliding-window cache changes: static cache (compiled) and dynamic cache (uncompiled)
+{"attn_implementation": "sdpa", "compile_kwargs": {}}
+{"attn_implementation": "sdpa"}
+{"attn_implementation": "flash_attention_2"}
