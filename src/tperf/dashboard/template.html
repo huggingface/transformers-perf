@@ -171,7 +171,7 @@ $("sub").textContent = `${D.host} · updated ${D.generated_at.replace("T", " ")}
 for (const [href, label] of [["index.html", "Overview"], ["main.html", "main"]].concat(P.kind === "ab" ? [[P.file, P.nav]] : [])) {
   const a = el("a", { href }, label); if (href === P.file) a.setAttribute("aria-current", "page"); $("nav").append(a);
 }
-for (const [href, label] of [[P.link, "on GitHub"], [P.ci_link, "CI test results"]]) {
+for (const [href, label] of [[P.link, "on GitHub"]]) {
   if (href) { $("sub").append(" · "); $("sub").append(el("a", { href, target: "_blank", rel: "noopener" }, label)); }
 }
 $(P.kind === "index" ? "overview" : P.kind === "main" ? "main-page" : "ab-page").hidden = false;

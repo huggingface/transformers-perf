@@ -9,8 +9,7 @@ each of the series' points of the last DAILY_WINDOW daily runs (see `every_day`)
 
     tperf dashboard build --out /tmp/dash [--publish hf-internal-testing/transformers-perf-dashboard]
 
-Runs on the bench host (it has the token that reads the private dataset). The page is self-contained: the data is
-embedded at build time, so the Space holds no secrets. The Space is public; the dataset it is built from stays private.
+Runs on the bench host after each daily run. The pages are self-contained: the data is embedded at build time.
 """
 
 from __future__ import annotations
@@ -312,12 +311,6 @@ def pr_titles(numbers) -> dict:
     return titles
 
 
-# transformers CI test results for a PR (Grafana), linked from its page
-CI_DASHBOARD = (
-    "https://transformers-ci.huggingface.cool/d/pytest-observability-by-pr/branch"
-    "?var-pr={pr}&from=now-90d&to=now&timezone=browser"
-)
-
 VERDICT_CLASS = {
     "REGRESSION": "regression",
     "improvement": "improvement",
@@ -371,7 +364,6 @@ def build(rows: list[dict], proc_rows: list[dict] = ()) -> dict[str, dict]:
                 "nav": label,
                 "heading": heading,
                 "link": f"https://github.com/huggingface/transformers/pull/{n}" if n else None,
-                "ci_link": CI_DASHBOARD.format(pr=n) if n else None,
             },
             "abs": runs,
         }
