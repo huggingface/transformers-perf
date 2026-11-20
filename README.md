@@ -13,7 +13,7 @@ pip install -e .                       # installs the tperf command
 cp tperf.example.toml tperf.toml       # set [host] ssh (tperf.toml is not committed)
 tperf host install                     # CUDA, torch, transformers under /opt/bench on the host
 tperf host tune apply                  # quiet the host (status / revert)
-tperf deploy                           # copy tperf, the harness and scenarios; install the daily timer
+tperf deploy                           # copy tperf (harness included) and scenarios; install the daily timer
 ```
 
 ## Usage
@@ -31,8 +31,9 @@ rebuilds the dashboard.
 
 ## Layout
 
-- `harness/`: the generation benchmark (formerly transformers' `benchmark_v2`), the same copy for every commit
 - `src/tperf/`: the package, one subpackage per feature (`ab`, `daily`, `processors`, `tp`, `baselines`, ...)
+- `src/tperf/harness/`: the generation benchmark (formerly transformers' `benchmark_v2`), the same copy for every
+  commit (`tperf harness run`); its tests are in `tests/harness/`
 - `scenarios/`: benchmark configs; `patches/`: transformers changes A/B-tested before their PR
 - `docs/`: [dataset card](docs/dataset-card.md), [findings](docs/findings.md)
 

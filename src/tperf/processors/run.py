@@ -29,12 +29,12 @@ from tperf.common.benchlib import (
     die,
     env_args,
     fetch_main,
+    fetch_results,
     locked,
     log,
     push_package,
     remote_module,
     run_module,
-    scp_from,
     scp_to,
     ssh,
     stamp,
@@ -71,7 +71,8 @@ def main(argv: list[str] | None = None) -> None:
     out.mkdir(parents=True, exist_ok=True)
     log(f"Results: {out}")
     ssh(["mkdir", "-p", rdir, "/opt/bench/proc-work"])
-    push_package()
+    src = f"{rdir}/src"  # this run's copy of the package (tperf.processors.bench)
+    push_package(src)
     scp_to([ROOT / SCENARIOS], f"{rdir}/scenarios.jsonl")
 
     sha = fetch_main(rev=MAIN_SHA)
@@ -90,8 +91,8 @@ def main(argv: list[str] | None = None) -> None:
                 bench = [
                     *env_args({**env, "OMP_NUM_THREADS": t, "CUDA_VISIBLE_DEVICES": GPU}),
                     "numactl", f"--physcpubind={cpus}", f"--membind={NODE}",
-                    *remote_module(PY, "processors.bench", pythonpath), "--scenarios", f"{rdir}/scenarios.jsonl",
-                    "--output-dir", d,
+                    *remote_module(PY, "processors.bench", f"{src}:{pythonpath}"),
+                    "--scenarios", f"{rdir}/scenarios.jsonl", "--output-dir", d,
                     "--threads", t, *PROC_ARGS,
                 ]  # fmt: skip
                 launch_txt = shlex.quote(f"commit {sha}, CPUs {cpus}")
@@ -107,7 +108,7 @@ def main(argv: list[str] | None = None) -> None:
                     ssh(["tail", "-20", f"{d}/run.log"], check=False, stdout=sys.stderr)
                     sys.exit(1)
 
-    scp_from(f"{rdir}/.", out, recursive=True)
+    fetch_results(rdir, out)
     summary = run_module("processors.summarize", out, check=True, text=True, stdout=subprocess.PIPE).stdout
     print(summary, end="")
     (out / "summary.txt").write_text(summary)

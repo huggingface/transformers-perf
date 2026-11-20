@@ -6,9 +6,10 @@ Environment:
   HOST          bench host, user@address (default: [host] ssh in tperf.toml)
   MODEL=meta-llama/Llama-2-7b-hf
   GPU_GROUPS="0 0,1 0,1,2,3"   one entry per configuration; a single GPU runs without torchrun (TP1 baseline)
-  BENCH_ARGS   run_benchmarks.py arguments (default: -w 5 -i 10 -b 1 -s 128 -n 64, like the daily llama2-7b)
+  BENCH_ARGS   tperf.harness.run_benchmarks arguments (default: -w 5 -i 10 -b 1 -s 128 -n 64, like the daily llama2-7b)
   SCENARIOS=scenarios/tp.jsonl
-  MAIN_SHA     transformers commit (default: latest main), checked out as a worktree (its src/; the harness is harness/ here)
+  MAIN_SHA     transformers commit (default: latest main), checked out as a worktree (its src/; the harness is
+               tperf.harness, pushed with the package)
   NCORES=8     cores per rank, on the group's NUMA node (first core skipped, no hyperthread siblings)
   NCCL_ENV="NCCL_CUMEM_HOST_ENABLE=0"   see `tperf baselines p2p`: without it NCCL's SHM buffers all land on node 0
 
@@ -38,7 +39,7 @@ from tperf.common.benchlib import (
     fetch_main,
     locked,
     log,
-    push_harness,
+    push_package,
     run_module,
     scp_from,
     scp_to,
@@ -74,7 +75,8 @@ def main(argv: list[str] | None = None) -> None:
     log(f"Results: {out}")
     ssh(["mkdir", "-p", rdir, "/opt/bench/tp-work"])
     scp_to([ROOT / SCENARIOS], f"{rdir}/scenarios.jsonl")
-    push_harness(rdir)
+    src = f"{rdir}/src"  # this run's copy of the package (the harness)
+    log(f"harness {push_package(src)}")
 
     # Worktree of main (its src/ only), removed at the end. Every run below holds the daily lock.
     sha = fetch_main(rev=MAIN_SHA)
@@ -94,17 +96,17 @@ def main(argv: list[str] | None = None) -> None:
                 launch = [PY, "-m", "torch.distributed.run", "--standalone", "--nproc-per-node", n] if n > 1 else [PY]
                 log(f"Run {i}/{a.runs}: TP{n} on GPUs {group} (NUMA node {node})")
                 bench = [
-                    *env_args({**env, "PYTHONPATH": f"{w.path}/src", "TORCHINDUCTOR_CACHE_DIR": f"{cc}/inductor",
+                    *env_args({**env, "PYTHONPATH": f"{src}:{w.path}/src", "TORCHINDUCTOR_CACHE_DIR": f"{cc}/inductor",
                                "TRITON_CACHE_DIR": f"{cc}/triton", "CUDA_VISIBLE_DEVICES": group,
                                "OMP_NUM_THREADS": NCORES}),
                     "numactl", f"--physcpubind={cpus}", f"--membind={node}",
-                    *launch, "run_benchmarks.py", "--output-dir", d, "--model-id", MODEL, *BENCH_ARGS,
+                    *launch, "-m", "tperf.harness.run_benchmarks", "--output-dir", d, "--model-id", MODEL, *BENCH_ARGS,
                     *(["--enable-tp"] if n > 1 else []), "--config-file", f"{rdir}/scenarios.jsonl",
                     "--no-gpu-monitoring", "--commit-id", sha, "--log-level", "WARNING",
                 ]  # fmt: skip
                 launch_txt = shlex.quote(f"GPUs {group}, CPUs {cpus}, {NCCL_ENV}")
                 rc = ssh(
-                    f"mkdir -p {d} && rm -rf {cc} && cd {rdir}/harness && echo {launch_txt} >{d}/launch.txt"
+                    f"mkdir -p {d} && rm -rf {cc} && cd {d} && echo {launch_txt} >{d}/launch.txt"
                     f" && {cmd(locked(bench))} >{d}/run.log 2>&1; rc=$?; rm -rf {cc}; exit $rc",
                     check=False,
                 ).returncode

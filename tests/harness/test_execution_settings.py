@@ -5,9 +5,9 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from harness.framework.benchmark_config import BenchmarkConfig
-from harness.framework.benchmark_runner import BenchmarkRunner
-from harness.framework.data_classes import BenchmarkResult
+from tperf.harness.framework.benchmark_config import BenchmarkConfig
+from tperf.harness.framework.benchmark_runner import BenchmarkRunner
+from tperf.harness.framework.data_classes import BenchmarkResult
 from transformers import BatchEncoding
 from transformers.generation.continuous_batching.requests import GenerationOutput, RequestStatus
 
@@ -45,8 +45,8 @@ def test_setup_exact_inputs_and_explicit_settings(continuous_batching, sequence_
         skip_validity_check=True,
     )
     with (
-        patch("harness.framework.benchmark_runner.AutoTokenizer.from_pretrained", return_value=tokenizer),
-        patch("harness.framework.benchmark_runner.AutoModelForCausalLM.from_pretrained", side_effect=load_model),
+        patch("tperf.harness.framework.benchmark_runner.AutoTokenizer.from_pretrained", return_value=tokenizer),
+        patch("tperf.harness.framework.benchmark_runner.AutoModelForCausalLM.from_pretrained", side_effect=load_model),
     ):
         runner.setup_benchmark("test-model", config)
 
@@ -72,7 +72,7 @@ def test_setup_exact_inputs_and_explicit_settings(continuous_batching, sequence_
         runner.torch_accelerator_module.memory_allocated.return_value = 0
         config.num_tokens_to_generate = 2
         config.gpu_monitoring = False
-        with patch("harness.framework.benchmark_runner.flush_memory"):
+        with patch("tperf.harness.framework.benchmark_runner.flush_memory"):
             runner.time_generate(config, warmup=False)
         assert model.generate_batch.call_args.kwargs["continuous_batching_config"] is runner.continuous_batching_config
         assert model.generate_batch.call_args.kwargs["persistent_manager"] is False
@@ -98,7 +98,6 @@ def test_config_round_trip_preserves_execution_policy():
 def test_suite_preserves_eos_settings(disable_eos):
     import importlib.util
     import sys
-    from pathlib import Path
 
     from transformers import ContinuousBatchingConfig, GenerationConfig
 
@@ -114,7 +113,7 @@ def test_suite_preserves_eos_settings(disable_eos):
             "lighteval.tasks.requests",
         ]
     }
-    path = Path(__file__).parents[1] / "benchmark_scripts" / "continuous_batching_overall.py"
+    path = importlib.util.find_spec("tperf.harness.benchmark_scripts.continuous_batching_overall").origin
     spec = importlib.util.spec_from_file_location("_cb_suite_under_test", path)
     suite = importlib.util.module_from_spec(spec)
     with patch.dict(sys.modules, {**modules, spec.name: suite}):

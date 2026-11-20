@@ -1,15 +1,17 @@
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-from harness.framework.benchmark_runner import get_git_revision
-from harness.framework.compare import compare, format_report, load_scenarios
+import tperf
+from tperf.harness.framework.benchmark_runner import get_git_revision
+from tperf.harness.framework.compare import compare, format_report, load_scenarios
 
 
-BENCHMARK_V2_DIR = Path(__file__).parent.parent
+PKG_SRC = Path(tperf.__file__).resolve().parents[1]  # the directory holding the tperf package
 
 
 def write_results(path: Path, scenarios: dict[str, list[float]], failed: tuple[str, ...] = ()) -> Path:
@@ -92,7 +94,8 @@ def test_cli_exit_code(tmp_path, factor, exit_code):
     result = subprocess.run(
         [
             sys.executable,
-            "compare_results.py",
+            "-m",
+            "tperf.harness.compare_results",
             "--baseline",
             str(base),
             "--candidate",
@@ -100,7 +103,7 @@ def test_cli_exit_code(tmp_path, factor, exit_code):
             "--json",
             str(out_json),
         ],
-        cwd=BENCHMARK_V2_DIR,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [str(PKG_SRC), os.environ.get("PYTHONPATH")]))},
         capture_output=True,
         text=True,
     )

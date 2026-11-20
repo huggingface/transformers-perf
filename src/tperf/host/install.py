@@ -6,7 +6,7 @@ Usage: tperf host install        (pipes this file to `ssh HOST sudo python3 -`; 
 Installs into /opt/bench:
   nvbandwidth/   NVIDIA nvbandwidth (host<->device and device<->device copy bandwidth)
   venv/          Python venv with PyTorch (cuBLAS GEMM throughput)
-  transformers/  transformers at TF_COMMIT (the harness comes from this repository: tperf deploy)
+  transformers/  transformers at TF_COMMIT (the harness comes with the tperf package: tperf deploy)
   tbv2-venv/     Python venv for harness: same torch pin, transformers editable install
 All versions are pinned so baselines stay comparable. Idempotent.
 """
@@ -128,7 +128,7 @@ def main() -> None:
         pipv("--upgrade", "pip")
         pipv(f"torch=={TORCH_VERSION}")
         pipv("-e", f"{tf}[torch]")
-        # harness/requirements.txt without amdsmi / pyzes (AMD / Intel monitoring, unused on NVIDIA)
+        # The harness's dependencies (`host` extra in pyproject.toml), without amdsmi / pyzes (AMD / Intel monitoring)
         pipv("numpy", "psutil", "nvidia-ml-py", "datasets", "huggingface_hub")
     # kernels: lets harness run flash_attention_2 (kernel fetched from the Hub on first use)
     # and the kernelized scenarios. transformers at TF_COMMIT requires kernels>=0.18.2,<0.19.

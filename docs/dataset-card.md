@@ -16,7 +16,7 @@ masked). Each run is published by `tperf record publish` (generation) or `tperf 
 - `processors/<YYYY-MM>/<group>.parquet`: multimodal processor and encoder runs, one row per (run, scenario)
 - `raw/<YYYY-MM>/<run_id>/`: the files the rows were built from (`manifest.json`, `probe.json`, harness results)
 
-A *run* is one `run_benchmarks.py` invocation. Runs repeated back to back share a `group_id`.
+A *run* is one harness (`tperf.harness.run_benchmarks`) invocation. Runs repeated back to back share a `group_id`.
 
 ## Columns
 

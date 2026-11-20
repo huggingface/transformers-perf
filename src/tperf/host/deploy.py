@@ -1,10 +1,12 @@
-"""Install or update the tooling (the tperf package, the harness, the scenarios) and the daily main benchmark on the host.
+"""Install or update the tooling (the tperf package, harness included, and the scenarios) and the daily main
+benchmark on the host.
 
 Usage: tperf deploy            # copy tooling, install bench-daily.timer (03:00 UTC)
        tperf deploy --run-now  # same, then start a run immediately (in the background)
 
-On the host: the tperf package in /opt/bench/src/tperf (run with PYTHONPATH=/opt/bench/src), the harness in
-/opt/bench/harness, the scenarios in /opt/bench/daily/scenarios.
+On the host: the tperf package in /opt/bench/src/tperf (run with PYTHONPATH=/opt/bench/src), with the harness in
+/opt/bench/src/tperf/harness (its version in VERSION there), the scenarios in /opt/bench/daily/scenarios. Only this
+command writes /opt/bench/src: the other commands push the package to their own run directory.
 Logs: ssh $HOST journalctl -u bench-daily -e     Results: /opt/bench/daily/results, and the dataset.
 
 Also here: `tperf host tune [apply|status|revert]` and `tperf host install`, which pipe the standalone
@@ -21,13 +23,14 @@ from tperf.common.benchlib import (
     DATASET,
     HOST,
     PKG_SRC,
+    REMOTE_SRC,
     ROOT,
     SSH,
-    push_harness,
     push_package,
     require_host,
     scp_to,
     ssh,
+    stamp,
 )
 
 
@@ -41,13 +44,14 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--run-now", action="store_true", help="start a run right after deploying")
     args = parser.parse_args(argv)
 
-    ssh("mkdir -p /opt/bench/daily/scenarios && rm -rf /opt/bench/daily/harness-patches")
-    # The harness, staged then swapped in: a running daily job keeps the copy it started with
-    version = push_harness("/opt/bench/harness-new")
-    ssh("rm -rf /opt/bench/harness && mv /opt/bench/harness-new/harness /opt/bench/ && rmdir /opt/bench/harness-new")
+    # /opt/bench/harness: the harness's old place, before it moved into the package
+    ssh("mkdir -p /opt/bench/daily/scenarios && rm -rf /opt/bench/daily/harness-patches /opt/bench/harness")
+    # The package (harness, daily run, recording, noise probe, processors, dashboard), staged then swapped in: a
+    # process that already started keeps the modules it imported
+    staging = f"{REMOTE_SRC}/.tperf-{stamp()}-{os.getpid()}"
+    version = push_package(staging)
+    ssh(f"rm -rf {REMOTE_SRC}/tperf && mv -T {staging}/tperf {REMOTE_SRC}/tperf && rmdir {staging}")
     print(f"harness {version}")
-    # The package (daily run, recording, noise probe, processors, dashboard), staged then swapped in the same way
-    push_package()
     # Where the daily run publishes, from tperf.toml (read by bench-daily.service)
     env = f"PUBLISH_REPO={DATASET}\nDASHBOARD_SPACE={DASHBOARD_SPACE}\n"
     subprocess.run([*SSH, require_host(), "cat >/opt/bench/tperf.env"], input=env, text=True, check=True)

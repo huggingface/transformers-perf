@@ -3,8 +3,8 @@
 `tperf deploy` copies the tperf package to /opt/bench/src/tperf; bench-daily.timer runs this module as ubuntu with
 /usr/bin/python3 -m tperf.daily.main and PYTHONPATH=/opt/bench/src (standard library only: the system python has no
 third-party packages). The other host-side modules (tperf.common.record, tperf.common.noise_probe,
-tperf.processors.bench, tperf.dashboard.build) run in the tbv2-venv with the same PYTHONPATH. The harness is
-this repository's harness, deployed to /opt/bench/harness; the worktree of main only provides src/.
+tperf.processors.bench, tperf.dashboard.build) and the harness (tperf.harness.run_benchmarks) run in the tbv2-venv with
+the same PYTHONPATH: the harness is the deployed package's, the worktree of main only provides transformers' src/.
 Results, work trees and scenarios are under /opt/bench/daily.
 Manual run: PYTHONPATH=/opt/bench/src /usr/bin/python3 -m tperf.daily.main [suite...]   (default: every suite below)
 
@@ -36,7 +36,7 @@ D = Path("/opt/bench/daily")
 SRC = "/opt/bench/src"  # the tperf package, deployed by `tperf deploy`
 TF = "/opt/bench/transformers"
 PY = "/opt/bench/tbv2-venv/bin/python"
-HARNESS = Path("/opt/bench/harness")
+HARNESS_VERSION = Path(SRC) / "tperf/harness/VERSION"  # written by `tperf deploy`
 REPO_URL = "https://github.com/huggingface/transformers.git"
 LOCK = "/tmp/bench-daily.lock"
 # Set by tperf deploy from tperf.toml, in /opt/bench/tperf.env (EnvironmentFile of the service)
@@ -44,7 +44,7 @@ PUBLISH_REPO = os.environ.get("PUBLISH_REPO") or "hf-internal-testing/transforme
 DASHBOARD_SPACE = os.environ.get("DASHBOARD_SPACE", "hf-internal-testing/transformers-perf-dashboard")
 RUNS = int(os.environ.get("RUNS") or 3)
 MAIN_SHA = os.environ.get("MAIN_SHA", "")  # commit to benchmark instead of the latest main
-ARGS = os.environ.get("ARGS", "")  # run_benchmarks.py arguments replacing the suites' own
+ARGS = os.environ.get("ARGS", "")  # tperf.harness.run_benchmarks arguments replacing the suites' own
 LABEL_PREFIX = os.environ.get("LABEL_PREFIX") or "daily"  # rows are <prefix>-<suite>; the dashboard's are daily-*
 NCORES = int(os.environ.get("NCORES") or 8)
 GPU_NUMA_MAP = [int(n) for n in (os.environ.get("GPU_NUMA_MAP") or "0 0 0 0 1 1 1 1").split()]
@@ -148,7 +148,7 @@ class Daily:
             TRITON_CACHE_DIR=f"{cc}/triton",
         )
         logf = open(d / "run.log", "w")
-        io = dict(cwd=HARNESS, env=env, stdout=logf, stderr=subprocess.STDOUT)
+        io = dict(cwd=d, env=env, stdout=logf, stderr=subprocess.STDOUT)
         manifest = subprocess.run(
             argv(*module("common.record"), "manifest", "--out", d / "manifest.json", "--gpu", gpu,
              "--cpus", cpus, "--numa-node", node, "--model", model, "--bench-args", f"{args} {shlex.join(scen_arg)}",
@@ -162,7 +162,7 @@ class Daily:
         proc = subprocess.Popen(
             argv("numactl", f"--physcpubind={cpus}", f"--membind={node}",
              *module("common.noise_probe"), "--cpus", cpus, "--gpu", gpu, "--out", d / "probe.json", "--",
-             PY, "run_benchmarks.py", "--output-dir", d, "--model-id", model, *shlex.split(args), *scen_arg,
+             *module("harness.run_benchmarks"), "--output-dir", d, "--model-id", model, *shlex.split(args), *scen_arg,
              "--no-gpu-monitoring", "--commit-id", self.sha, "--log-level", "WARNING"),
             **io,
         )  # fmt: skip
@@ -236,7 +236,7 @@ for m in {{s['model'] for s in scenarios if s.get('stage', 'processor') != 'proc
             ["git", "-C", self.w, "log", "-1", "--format=%s"], check=True, text=True, capture_output=True
         ).stdout.strip()
         log(f"main {self.sha[:10]}: {subject}")
-        self.harness_version = (HARNESS / "VERSION").read_text().strip()
+        self.harness_version = HARNESS_VERSION.read_text().strip()
         log(f"harness {self.harness_version}")
 
         for s in gpu_suites:
@@ -285,7 +285,7 @@ def main(argv: list[str] | None = None) -> int:
     except BlockingIOError:
         log("another daily run holds the lock, skipping")
         return 0
-    if subprocess.run(["pgrep", "-f", "run_benchmarks.py"], stdout=subprocess.DEVNULL).returncode == 0:
+    if subprocess.run(["pgrep", "-f", "run_benchmarks"], stdout=subprocess.DEVNULL).returncode == 0:
         log("a benchmark is already running on this host, skipping")
         return 0
 

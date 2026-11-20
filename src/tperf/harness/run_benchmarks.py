@@ -14,8 +14,10 @@
 # limitations under the License.
 
 """
-Top-level benchmarking script that automatically discovers and runs all benchmarks
-in the ./benches directory, organizing outputs into model-specific subfolders.
+Run the generation benchmark scenarios on one model and save the results (see README.md).
+
+    python -m tperf.harness.run_benchmarks --model-id <model> -b 1 -s 128 -n 64 --output-dir <dir>
+    tperf harness run --model-id <model> -b 1 -s 128 -n 64 --output-dir <dir>
 """
 
 import argparse
@@ -24,13 +26,10 @@ import logging
 import sys
 import uuid
 
-from framework.benchmark_config import BenchmarkConfig, adapt_configs, get_config_by_level
-from framework.benchmark_runner import BenchmarkRunner
 
-
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> None:
     # Parse arguments
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--output-dir", type=str, default=None, help="Output dir for benchmark results")
     parser.add_argument("--log-level", type=str, choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="WARNING")
     parser.add_argument("--model-id", type=str, help="Specific model ID to benchmark (if supported by benchmarks)")
@@ -74,7 +73,11 @@ if __name__ == "__main__":
         default=None,
         help="Name of the dataset to push results to. If not provided, results are not pushed to the Hub.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    # torch and transformers are imported once the arguments are parsed (`--help` works without them)
+    from tperf.harness.framework.benchmark_config import BenchmarkConfig, adapt_configs, get_config_by_level
+    from tperf.harness.framework.benchmark_runner import BenchmarkRunner
 
     # Setup logging
     benchmark_run_uuid = str(uuid.uuid4())[:8]
@@ -139,3 +142,7 @@ if __name__ == "__main__":
     dataset_id = args.push_result_to_dataset
     if dataset_id is not None and len(results) > 0 and runner._is_primary_process():
         runner.push_results_to_hub(dataset_id, results, timestamp)
+
+
+if __name__ == "__main__":
+    main()

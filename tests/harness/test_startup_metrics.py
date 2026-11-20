@@ -1,7 +1,7 @@
 import torch
 
-from harness.framework.benchmark_runner import BenchmarkRunner
-from harness.framework.data_classes import BenchmarkResult
+from tperf.harness.framework.benchmark_runner import BenchmarkRunner
+from tperf.harness.framework.data_classes import BenchmarkResult
 
 
 def test_startup_metrics_round_trip():

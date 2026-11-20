@@ -22,18 +22,17 @@ from tperf.common.benchlib import (
     ROOT,
     HF_ENV,
     PY,
-    REMOTE_SRC,
     Worktree,
     cmd,
     cpus_for,
     die,
     env_args,
     fetch_main,
+    fetch_results,
     locked,
     log,
     push_package,
     run_module,
-    scp_from,
     scp_to,
     ssh,
     stamp,
@@ -61,7 +60,8 @@ def main(argv: list[str] | None = None) -> None:
     out.mkdir(parents=True, exist_ok=True)
     log(f"Results: {out}")
     ssh(["mkdir", "-p", f"{rdir}/src-patches", "/opt/bench/tp-work"])
-    push_package()
+    src = f"{rdir}/src"  # this run's copy of the package (tperf.tp.profile)
+    push_package(src)
     if SRC_PATCHES:
         scp_to(SRC_PATCHES, f"{rdir}/src-patches/")
 
@@ -83,7 +83,7 @@ def main(argv: list[str] | None = None) -> None:
             launch = [PY, "-m", "torch.distributed.run", "--standalone", "--nproc-per-node", n] if n > 1 else [PY]
             log(f"TP{n} on GPUs {group}")
             profile = [
-                *env_args({**env, "PYTHONPATH": f"{REMOTE_SRC}:{w.path}/src", "TORCHINDUCTOR_CACHE_DIR": f"{cc}/inductor",
+                *env_args({**env, "PYTHONPATH": f"{src}:{w.path}/src", "TORCHINDUCTOR_CACHE_DIR": f"{cc}/inductor",
                            "TRITON_CACHE_DIR": f"{cc}/triton", "CUDA_VISIBLE_DEVICES": group,
                            "OMP_NUM_THREADS": NCORES}),
                 "numactl", f"--physcpubind={cpus}", f"--membind={node}",
@@ -101,7 +101,7 @@ def main(argv: list[str] | None = None) -> None:
                 ssh(["tail", "-30", f"{rdir}/tp{n}.log"], check=False, stdout=sys.stderr)
                 sys.exit(1)
 
-    scp_from(f"{rdir}/.", out, recursive=True)
+    fetch_results(rdir, out)
     summary = run_module(
         "tp.summarize", *sorted(out.glob("tp*.jsonl")), check=True, text=True, stdout=subprocess.PIPE
     ).stdout

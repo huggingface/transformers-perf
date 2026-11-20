@@ -36,10 +36,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("label", nargs="?", default="baseline")
     label = p.parse_args(argv).label
 
-    out = ROOT / "results" / f"{stamp()}-{label}"
+    st = stamp()
+    out = ROOT / "results" / f"{st}-{label}"
     out.mkdir(parents=True, exist_ok=True)
     log(f"Results: {out}")
-    push_package()
+    src = f"/opt/bench/baselines-results/{st}-{label}/src"  # this run's copy of the package (tperf.baselines.gemm)
+    push_package(src)
 
     log("Snapshotting host state")
     status = re.sub(r"\x1b\[[0-9;]*m", "", tune_host("status"))
@@ -63,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
             ssh(counters, stdout=f)
         gemm = ssh(
             [*env_args({"CUDA_VISIBLE_DEVICES": g}), "numactl", f"--cpunodebind={node}", f"--membind={node}",
-             *remote_module("/opt/bench/venv/bin/python", "baselines.gemm"), "--dtype", "bf16"],
+             *remote_module("/opt/bench/venv/bin/python", "baselines.gemm", src), "--dtype", "bf16"],
             capture=True,
         ).stdout  # fmt: skip
         with open(out / "gemm.jsonl", "a") as f:

@@ -3,3 +3,5 @@ results/
 __pycache__/
 .DS_Store
 tperf.toml
+benchmark_results/
+benchmark_results_profiles/

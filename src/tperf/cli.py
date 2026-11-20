@@ -44,8 +44,17 @@ COMMANDS: dict[str, dict[str, tuple[str, str]]] = {
         "tune": ("tperf.host.deploy:tune", "tune the host for low noise: tperf host tune [apply|status|revert]"),
         "install": ("tperf.host.deploy:install", "install CUDA, nvbandwidth, torch, transformers under /opt/bench"),
     },
-    "deploy": {"": ("tperf.host.deploy", "copy the package, harness and scenarios to the host, install the timer")},
-    "harness": {"": ("tperf.common.harness", "harness version, or copy it to a host: tperf harness version")},
+    "deploy": {
+        "": ("tperf.host.deploy", "copy the package (harness included) and scenarios to the host, install the timer")
+    },
+    "harness": {
+        "run": (
+            "tperf.harness.run_benchmarks",
+            "run the generation benchmark here (python -m tperf.harness.run_benchmarks)",
+        ),
+        "compare": ("tperf.harness.compare_results", "compare harness results against a baseline, flag regressions"),
+        "version": ("tperf.common.harness", "harness version: last commit that changed src/tperf/harness"),
+    },
     "dashboard": {"build": ("tperf.dashboard.build", "build (and publish) the dashboard from the dataset")},
     "record": {"": ("tperf.common.record", "host side: write a run manifest, publish runs to the dataset")},
     "daily": {"": ("tperf.daily.main", "host side: the daily main benchmark (run by bench-daily.timer)")},

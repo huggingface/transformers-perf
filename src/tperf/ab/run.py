@@ -8,18 +8,19 @@ Environment:
   HOST          bench host, user@address (default: [host] ssh in tperf.toml)
   MODEL         model id (required)
   SCENARIOS     harness config file (.jsonl) with the scenarios to run (default: --level 1)
-  BENCH_ARGS    run_benchmarks.py arguments (default: -w 5 -i 10 -b 1 -s 128 -n 64). A PR changes the cost of
-                prefill and/or of each decode step, so a few dozen decode steps show it as well as hundreds:
+  BENCH_ARGS    tperf.harness.run_benchmarks arguments (default: -w 5 -i 10 -b 1 -s 128 -n 64). A PR changes the
+                cost of prefill and/or of each decode step, so a few dozen decode steps show it as well as hundreds:
                 raise -n only when the change needs a longer sequence (e.g. crossing a sliding window)
   BASE          commit to compare against (default: the merge base of the PR with main, so the only
                 difference between the sides is the PR's diff; for a merged PR, head is the commit it was
                 merged as and base is its parent, i.e. main right before the merge)
-  HARNESS_PATCHES  patches applied to the shared harness copy (default: none), e.g. patches/*.patch
+  HARNESS_PATCHES  patches to the harness applied to both sides (default: none), e.g. patches/*.patch; paths
+                start with src/tperf/harness/ (relative to this repository's root)
   HEAD_PATCHES  patches applied to the head side's transformers checkout (with `main`: test a change before
                 opening its PR; base is the main tip, head is the main tip plus the patches)
-  HEAD_EXTRA_PATCHES  patches applied to the head side's harness only (a separate copy), to A/B a change
-                to the benchmark itself; with `main` as the PR, both sides run the main tip. Patch paths start
-                with harness/
+  HEAD_EXTRA_PATCHES  patches applied to the head side's harness only (a separate copy of the package), to A/B a
+                change to the benchmark itself; with `main` as the PR, both sides run the main tip. Patch paths
+                start with src/tperf/harness/
   GPUS="0 4"    the two GPUs used, one per NUMA node; NCORES=8 cores each on the GPU's node
   TP=1          tensor parallel size: each side runs under torchrun with --enable-tp on TP GPUs of one NUMA node
                 (GPUS defaults to "0,1 4,5" for TP=2, "0,1,2,3 4,5,6,7" for TP=4), NCORES cores per rank
@@ -28,11 +29,13 @@ Environment:
   DASHBOARD_SPACE  Space rebuilt after publishing (default: [hub] dashboard_space in tperf.toml,
                 "" to skip)
 
-Layout on the host, under /opt/bench/ab/<id>/: base/ and head/ (worktrees of the two commits), harness/harness
-(this repository's harness, with HARNESS_PATCHES applied, drives both sides), results/round<r>-<side>/.
+Layout on the host, under /opt/bench/ab/<id>/: base/ and head/ (worktrees of the two commits), src/tperf (this
+repository's package, with HARNESS_PATCHES applied: its harness drives both sides), src-head/tperf (head's copy, with
+HEAD_EXTRA_PATCHES too, only when set), results/round<r>-<side>/.
 
 Each round re-applies the host tuning, then runs base and head at the same time, one per GPU (one per NUMA
-node, so they share no cores, memory or PCIe), each with PYTHONPATH pointing at its checkout's src/. The GPUs
+node, so they share no cores, memory or PCIe), each with PYTHONPATH pointing at the package copy and its checkout's
+src/. The GPUs
 swap every round, so chip-to-chip differences cancel out. `tperf ab compare` then compares the sides round by round.
 """
 
@@ -49,8 +52,8 @@ import sys
 
 from tperf.common.benchlib import (
     DASHBOARD_SPACE, GPU_NUMA_MAP, ROOT, HF_ENV, HOST, PY, REPO_URL, SSH, TF, Worktree, cmd, cpus_for, daily_lock_free, die,
-    download_model, env_args, harness_version, log, push_harness, push_package, remote_module, run_module, scp_from,
-    scp_to, ssh, ssh_out, stamp, tune_host,
+    download_model, env_args, log, push_package, remote_module, run_module, scp_from, scp_to, ssh, ssh_out, stamp,
+    tune_host,
 )  # fmt: skip
 
 
@@ -87,7 +90,6 @@ def main(argv: list[str] | None = None) -> None:
     harness_patches = patches("HARNESS_PATCHES")
     head_patches = patches("HEAD_PATCHES")
     head_extra_patches = patches("HEAD_EXTRA_PATCHES")
-    version = harness_version()
 
     if len(gpus) != 2:
         die("GPUS needs two GPU groups (one GPU each without TP)")
@@ -150,31 +152,34 @@ def main(argv: list[str] | None = None) -> None:
         stack.enter_context(Worktree(f"{ab}/base", base_sha))
         stack.enter_context(Worktree(f"{ab}/head", head_sha))
 
-        # --- Harness: one harness copy for both sides (two with HEAD_EXTRA_PATCHES) ---
-        def apply_patches(target: str, paths: list[str], prefix: str = "") -> None:
-            """The change is what is measured, so a patch that does not apply stops the run."""
+        # --- Package (harness, record, noise probe, dashboard): one copy for both sides, two with HEAD_EXTRA_PATCHES ---
+        def apply_patches(target: str, paths: list[str], prefix: str = "", strip: int = 1) -> None:
+            """The change is what is measured, so a patch that does not apply stops the run.
+
+            Harness patches are relative to this repository's root (src/tperf/harness/...): applied inside a package
+            copy (<copy>/tperf/harness/...) with strip=2 (`git apply -p2` drops a/src/).
+            """
             for p in paths:
                 remote = f"{ab}/{prefix}{os.path.basename(p)}"
                 scp_to([p], remote)
-                if ssh(["git", "-C", f"{ab}/{target}", "apply", remote], check=False).returncode:
+                if ssh(["git", "-C", f"{ab}/{target}", "apply", f"-p{strip}", remote], check=False).returncode:
                     die(f"{os.path.basename(p)} does not apply to {target}")
                 log(f"{target}: applied {os.path.basename(p)}")
 
-        push_harness(f"{ab}/harness")
+        version = push_package(f"{ab}/src")
         extra_names = {os.path.basename(p) for p in head_extra_patches}
         shared = [p for p in harness_patches if p not in head_extra_patches and os.path.basename(p) not in extra_names]
-        apply_patches("harness", shared)
+        apply_patches("src", shared, strip=2)
         apply_patches("head", head_patches, prefix="head-")  # the change under test: never skip it
-        head_harness = "harness"
+        head_src = "src"
         if head_extra_patches:
-            head_harness = "harness-head"
-            push_harness(f"{ab}/harness-head")
-            apply_patches("harness-head", shared + head_extra_patches)
+            head_src = "src-head"
+            push_package(f"{ab}/src-head")
+            apply_patches("src-head", shared + head_extra_patches, prefix="src-head-", strip=2)
         scen_arg = ["--level", "1"]
         if scenarios:
             scp_to([scenarios], f"{ab}/scenarios.jsonl")
             scen_arg = ["--config-file", f"{ab}/scenarios.jsonl"]
-        push_package()  # tperf.common.record, tperf.common.noise_probe and tperf.dashboard.build run on the host
         for side in ("base", "head"):
             check = (
                 f"import transformers, sys; f = transformers.__file__; "
@@ -211,12 +216,12 @@ def main(argv: list[str] | None = None) -> None:
             gpu, node = group.split(",")[0], node_of[group]
             sha = base_sha if side == "base" else head_sha
             out_dir = f"{ab}/results/round{rnd}-{side}"
-            harness = "harness" if side == "base" else head_harness
+            src = f"{ab}/src" if side == "base" else f"{ab}/{head_src}"  # the package (harness) this side runs
             # Fresh torch.compile / Triton caches per run: every run measures a true cold start, whatever ran before
             cc = f"/mnt/cache/compile-cache/{ab_id}-r{rnd}-{side}"
             env = {
                 **HF_ENV,
-                "PYTHONPATH": f"{ab}/{side}/src",
+                "PYTHONPATH": f"{src}:{ab}/{side}/src",
                 "TRANSFORMERS_DIR": f"{ab}/{side}",
                 "BENCH_SOURCE": "main" if side == "base" else "pr",
                 "BENCH_PR": pr_num,
@@ -246,12 +251,12 @@ def main(argv: list[str] | None = None) -> None:
                 "numactl", f"--physcpubind={cpus[node]}", f"--membind={node}",
                 *remote_module(PY, "common.noise_probe", env["PYTHONPATH"]),
                 "--cpus", cpus[node], "--gpu", gpu, "--out", f"{out_dir}/probe.json",
-                "--", *launch, "run_benchmarks.py", "--output-dir", out_dir, "--model-id", model,
+                "--", *launch, "-m", "tperf.harness.run_benchmarks", "--output-dir", out_dir, "--model-id", model,
                 *shlex.split(bench_args), *scen_arg, *tp_args, "--no-gpu-monitoring", "--commit-id", sha,
                 "--log-level", "WARNING",
             ]  # fmt: skip
             return (
-                f"mkdir -p {out_dir} && rm -rf {cc} && cd {ab}/{harness}/harness && {cmd(manifest)} && "
+                f"mkdir -p {out_dir} && rm -rf {cc} && cd {out_dir} && {cmd(manifest)} && "
                 f"{cmd(run)} >{out_dir}/run.log 2>&1; rc=$?; rm -rf {cc}; exit $rc"
             )
 
@@ -277,7 +282,7 @@ def main(argv: list[str] | None = None) -> None:
         log(f"Publishing to {publish_repo}")
         hub_env = env_args({**HF_ENV, "HF_HUB_DISABLE_PROGRESS_BARS": 1})
         published = ssh(
-            f"{cmd([*hub_env, *remote_module(PY, 'common.record'), 'publish'])} {ab}/results/round* "
+            f"{cmd([*hub_env, *remote_module(PY, 'common.record', f'{ab}/src'), 'publish'])} {ab}/results/round* "
             f"{cmd(['--repo', publish_repo])}",
             capture=True,
         ).stdout.strip()  # fmt: skip
@@ -287,8 +292,8 @@ def main(argv: list[str] | None = None) -> None:
         if dashboard_space:
             try:
                 built = ssh_out([
-                    *hub_env, "nice", "-n", 19, *remote_module(PY, "dashboard.build"), "--dataset", publish_repo,
-                    "--out", "/tmp/bench-dashboard", "--publish", dashboard_space,
+                    *hub_env, "nice", "-n", 19, *remote_module(PY, "dashboard.build", f"{ab}/src"),
+                    "--dataset", publish_repo, "--out", "/tmp/bench-dashboard", "--publish", dashboard_space,
                 ])  # fmt: skip
                 print(built.splitlines()[-1] if built else "")
             except subprocess.CalledProcessError:

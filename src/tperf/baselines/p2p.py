@@ -25,7 +25,7 @@ import sys
 
 
 from tperf.common.benchlib import (
-    ROOT, env_args, log, push_package, remote_module, run_module, scp_from, ssh, stamp, tune_host,
+    ROOT, env_args, fetch_results, log, push_package, remote_module, run_module, ssh, stamp, tune_host,
 )  # fmt: skip
 
 
@@ -45,7 +45,8 @@ def main(argv: list[str] | None = None) -> int:
     rdir = f"/opt/bench/p2p-results/{st}-{label}"
     out.mkdir(parents=True, exist_ok=True)
     log(f"Results: {out}")
-    push_package()
+    src = f"{rdir}/src"  # this run's copy of the package (tperf.baselines.nccl_launch and nccl_bench)
+    push_package(src)
     tune_host("apply")
     (out / "host-status.txt").write_text(re.sub(r"\x1b\[[0-9;]*m", "", tune_host("status")))
     torch_version = 'import torch; print("torch", torch.__version__, "nccl", torch.cuda.nccl.version())'
@@ -56,9 +57,9 @@ def main(argv: list[str] | None = None) -> int:
 
     log(f"Groups: {' '.join(GPU_GROUPS)}, {RUNS} runs each")
     # tperf.baselines.nccl_launch (system python, standard library only) takes the daily lock itself.
-    ssh([*env_args({"BENCH_ARGS": BENCH_ARGS}), *NCCL_ENV.split(), *remote_module("python3", "baselines.nccl_launch"),
+    ssh([*env_args({"BENCH_ARGS": BENCH_ARGS}), *NCCL_ENV.split(), *remote_module("python3", "baselines.nccl_launch", src),
          rdir, RUNS, *GPU_GROUPS])  # fmt: skip
-    scp_from(f"{rdir}/.", out, recursive=True)
+    fetch_results(rdir, out)
 
     summary = run_module("baselines.summarize_p2p", out, text=True, stdout=subprocess.PIPE)
     print(summary.stdout, end="")

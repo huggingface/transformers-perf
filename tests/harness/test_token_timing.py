@@ -5,14 +5,14 @@ import numpy as np
 import pytest
 import torch
 
-from harness.framework.benchmark_runner import BenchmarkRunner, BenchmarkStreamer
-from harness.framework.data_classes import BenchmarkResult
+from tperf.harness.framework.benchmark_runner import BenchmarkRunner, BenchmarkStreamer
+from tperf.harness.framework.data_classes import BenchmarkResult
 from transformers.generation.continuous_batching.requests import GenerationOutput, RequestStatus
 
 
 def test_stream_completion_is_not_a_token():
     streamer = BenchmarkStreamer()
-    with patch("harness.framework.benchmark_runner.time.perf_counter", side_effect=[1.0, 2.0]):
+    with patch("tperf.harness.framework.benchmark_runner.time.perf_counter", side_effect=[1.0, 2.0]):
         streamer.put(10)
         streamer.put(20)
         streamer.end()
@@ -58,8 +58,8 @@ def test_generation_token_timing(continuous_batching, num_tokens):
     # Completion occurs well after the final token and must only affect end-to-end latency.
     clock = [start, start + 0.5] if continuous_batching else [start, start + 0.001, *token_times, start + 0.5]
     with (
-        patch("harness.framework.benchmark_runner.time.perf_counter", side_effect=clock),
-        patch("harness.framework.benchmark_runner.flush_memory"),
+        patch("tperf.harness.framework.benchmark_runner.time.perf_counter", side_effect=clock),
+        patch("tperf.harness.framework.benchmark_runner.flush_memory"),
     ):
         latency, timestamps, output, gpu_metrics = runner.time_generate(config, warmup=False)
 

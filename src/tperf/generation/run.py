@@ -8,7 +8,7 @@ Environment:
   GPU=0       physical GPU index; runs are always one at a time
   NCORES=8    physical cores to pin to, on the GPU's NUMA node. The node's first core is
               skipped (housekeeping, IRQs) and hyperthread siblings are never used.
-  BENCH_ARGS  extra run_benchmarks.py arguments (default: -w 5 -i 30 -b 1 -s 128 -n 128 --level 1)
+  BENCH_ARGS  extra tperf.harness.run_benchmarks arguments (default: -w 5 -i 30 -b 1 -s 128 -n 128 --level 1)
   GPU_NUMA_MAP  GPU index -> NUMA node (default "0 0 0 0 1 1 1 1", measured on g5.48xlarge)
 
 Per run: tperf/host/prepare.py apply (drop caches, re-lock clocks), then harness under
@@ -32,8 +32,8 @@ import sys
 
 
 from tperf.common.benchlib import (
-    GPU_NUMA_MAP, ROOT, HF_ENV, HOST, PY, SSH, TF, cmd, cpus_for, die, download_model, env_args, harness_version, log,
-    push_harness, push_package, remote_module, run_module, scp_from, ssh, ssh_out, stamp, tune_host,
+    GPU_NUMA_MAP, ROOT, HF_ENV, HOST, PY, SSH, TF, cmd, cpus_for, die, download_model, env_args, log, push_package,
+    remote_module, run_module, scp_from, ssh, ssh_out, stamp, tune_host,
 )  # fmt: skip
 
 
@@ -53,7 +53,7 @@ def main(argv: list[str] | None = None) -> None:
     group = f"{stamp()}-{label}"
     out = ROOT / "results" / group
     rdir = f"/opt/bench/tbv2-results/{group}"
-    version = harness_version()
+    src = f"{rdir}/src"  # this run's copy of the package (harness, record, noise probe)
 
     node = GPU_NUMA_MAP[gpu]
     cpus = cpus_for(node, ncores)
@@ -62,8 +62,8 @@ def main(argv: list[str] | None = None) -> None:
     log(f"Model {model}, GPU {gpu}, NUMA node {node}, CPUs {cpus}, transformers {commit}")
     log(f"Results: {out}")
 
-    push_package()
-    push_harness(rdir)
+    version = push_package(src)
+    log(f"harness {version}")
     log("Pre-downloading the model (not timed)")
     download_model(model)
 
@@ -72,22 +72,25 @@ def main(argv: list[str] | None = None) -> None:
         tune_host("apply")
         (out / f"host-status-run{i}.txt").write_text(re.sub(r"\x1b\[[0-9;]*m", "", tune_host("status")))
         ssh([
-            *env_args({**tags, "BENCH_HARNESS": version}), *remote_module(PY, "common.record"), "manifest",
+            *env_args({**tags, "BENCH_HARNESS": version}), *remote_module(PY, "common.record", src), "manifest",
             "--out", f"{rdir}/run{i}/manifest.json", "--gpu", gpu, "--cpus", cpus, "--numa-node", node,
             "--model", model, "--bench-args", bench_args, "--group", group, "--run", i, "--label", label,
         ])  # fmt: skip
         # Fresh torch.compile / Triton caches per run: every run measures a true cold start
         cc = f"/mnt/cache/compile-cache/{group}-run{i}"
         env = {**HF_ENV, "TORCHINDUCTOR_CACHE_DIR": f"{cc}/inductor", "TRITON_CACHE_DIR": f"{cc}/triton",
-               "CUDA_VISIBLE_DEVICES": gpu}  # fmt: skip
+               "CUDA_VISIBLE_DEVICES": gpu, "PYTHONPATH": src}  # fmt: skip
         run = [
             *env_args(env), "numactl", f"--physcpubind={cpus}", f"--membind={node}",
-            *remote_module(PY, "common.noise_probe"), "--cpus", cpus, "--gpu", gpu, "--out", f"{rdir}/run{i}/probe.json",
-            "--",
-            PY, "run_benchmarks.py", "--output-dir", f"{rdir}/run{i}", "--model-id", model, *shlex.split(bench_args),
+            *remote_module(PY, "common.noise_probe", src), "--cpus", cpus, "--gpu", gpu,
+            "--out", f"{rdir}/run{i}/probe.json", "--",
+            PY, "-m", "tperf.harness.run_benchmarks", "--output-dir", f"{rdir}/run{i}", "--model-id", model,
+            *shlex.split(bench_args),
             "--no-gpu-monitoring", "--commit-id", commit, "--log-level", "WARNING",
         ]  # fmt: skip
-        remote = f"rm -rf {cc} && cd {rdir}/harness && {cmd(run)}; rc=$?; rm -rf {cc}; exit $rc"
+        remote = (
+            f"rm -rf {cc} && mkdir -p {rdir}/run{i} && cd {rdir}/run{i} && {cmd(run)}; rc=$?; rm -rf {cc}; exit $rc"
+        )
         run_log = out / f"run{i}.log"
         with open(run_log, "w") as f:
             failed = subprocess.run([*SSH, HOST, remote], stdout=f, stderr=subprocess.STDOUT).returncode
@@ -111,7 +114,7 @@ def main(argv: list[str] | None = None) -> None:
         log(f"Publishing to {publish_repo}")
         hub_env = env_args({**HF_ENV, "HF_HUB_DISABLE_PROGRESS_BARS": 1})
         published = ssh(
-            f"{cmd([*hub_env, *remote_module(PY, 'common.record'), 'publish'])} {rdir}/run* "
+            f"{cmd([*hub_env, *remote_module(PY, 'common.record', src), 'publish'])} {rdir}/run* "
             f"{cmd(['--repo', publish_repo])}",
             capture=True,
         ).stdout  # fmt: skip

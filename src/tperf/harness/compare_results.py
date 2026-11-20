@@ -16,7 +16,7 @@
 """
 Compare benchmark results against a baseline and flag regressions.
 
-    python compare_results.py --baseline results_main/ --candidate results_pr/ --threshold 1.0
+    python -m tperf.harness.compare_results --baseline results_main/ --candidate results_pr/ --threshold 1.0
 
 Each side is a results JSON file or a directory of them (e.g. several repeated runs). Exits with status 1 if any
 metric regressed by more than the threshold, so it can gate CI.
@@ -27,10 +27,10 @@ import json
 import sys
 from dataclasses import asdict
 
-from framework.compare import compare, format_report, load_scenarios
+from tperf.harness.framework.compare import compare, format_report, load_scenarios
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--baseline", nargs="+", required=True, help="Baseline result file(s) or directory(ies)")
     parser.add_argument("--candidate", nargs="+", required=True, help="Candidate result file(s) or directory(ies)")
@@ -38,7 +38,7 @@ if __name__ == "__main__":
         "--threshold", type=float, default=1.0, help="Change (in %%) above which a metric is a regression"
     )
     parser.add_argument("--json", type=str, help="Also write the comparison to this JSON file")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     baseline, baseline_failed = load_scenarios(args.baseline)
     candidate, candidate_failed = load_scenarios(args.candidate)
@@ -55,4 +55,8 @@ if __name__ == "__main__":
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump([asdict(c) for c in comparisons], f, indent=2)
-    sys.exit(1 if any(c.verdict == "regression" for c in comparisons) else 0)
+    return 1 if any(c.verdict == "regression" for c in comparisons) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

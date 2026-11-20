@@ -1,9 +1,11 @@
 """Helpers shared by the commands that drive the bench host from a workstation (tperf ab, tperf generation run, ...).
 
-Remote commands are built as argument lists and quoted with shlex.join; `ssh` runs them on HOST. The tperf package is
-copied to the host under REMOTE_SRC (`push_package`) and its host-side modules run there with
-`env PYTHONPATH=REMOTE_SRC <python> -m tperf.<module>` (`remote_module`). The modules the host's system python runs
-(tperf.daily.main, tperf.host.prepare, tperf.host.install, tperf.baselines.nccl_launch) only use the standard library.
+Remote commands are built as argument lists and quoted with shlex.join; `ssh` runs them on HOST. Each run copies the
+tperf package, the harness included, to its own directory on the host (`push_package(f"{rdir}/src")`) and runs its
+host-side modules from there with `env PYTHONPATH=<rdir>/src[:...] <python> -m tperf.<module>` (`remote_module`), so it
+never replaces the copy the daily run uses (REMOTE_SRC, written only by `tperf deploy`). The modules the host's system
+python runs (tperf.daily.main, tperf.host.prepare, tperf.host.install, tperf.baselines.nccl_launch) only use the
+standard library.
 """
 
 import os
@@ -22,10 +24,10 @@ PKG_SRC = Path(__file__).resolve().parents[2]  # the directory holding the tperf
 def _repo_root() -> Path:
     """The checkout this package runs from (editable install, or PYTHONPATH=src), else the current directory."""
     root = PKG_SRC.parent
-    return root if (root / "harness").is_dir() and (root / "pyproject.toml").is_file() else Path.cwd()
+    return root if (root / "pyproject.toml").is_file() and (root / "src/tperf").is_dir() else Path.cwd()
 
 
-ROOT = _repo_root()  # repository root: harness/, scenarios/, results/
+ROOT = _repo_root()  # repository root: scenarios/, patches/, results/
 
 
 def _load_config() -> dict:
@@ -48,7 +50,7 @@ SSH = ["ssh", "-o", "BatchMode=yes"]
 TF = "/opt/bench/transformers"  # transformers clone on the host (worktrees of the commits under test)
 PY = "/opt/bench/tbv2-venv/bin/python"  # harness environment on the host
 HF_CLI = "/opt/bench/tbv2-venv/bin/hf"
-REMOTE_SRC = "/opt/bench/src"  # the tperf package on the host (push_package), for PYTHONPATH
+REMOTE_SRC = "/opt/bench/src"  # the deployed tperf package the daily run uses (`tperf deploy`), for PYTHONPATH
 REPO_URL = "https://github.com/huggingface/transformers.git"
 DAILY_LOCK = "/tmp/bench-daily.lock"  # held by the daily run, and by every run that uses the GPUs
 # Hub cache and token on the host
@@ -114,31 +116,43 @@ def scp_from(source: str, dest: Path | str, recursive: bool = False) -> None:
     subprocess.run(["scp", "-q", *(["-r"] if recursive else []), f"{require_host()}:{source}", str(dest)], check=True)
 
 
+def fetch_results(rdir: str, dest: Path | str) -> None:
+    """Copy the contents of a remote run directory to dest, without the package pushed into it (rdir/src)."""
+    subprocess.run(
+        ["rsync", "-a", "--exclude=/src/", "-e", " ".join(SSH), f"{require_host()}:{rdir}/", f"{dest}/"], check=True
+    )
+
+
 def tune_host(action: str = "apply") -> str:
     """Run tperf/host/prepare.py <action> on the host as root (drop caches, lock clocks, ...); returns its output."""
     with open(PKG_SRC / "tperf/host/prepare.py") as f:
         return ssh(["sudo", "python3", "-", action], stdin=f, capture=True).stdout
 
 
-def push_package() -> None:
-    """Copy this tperf package to REMOTE_SRC/tperf on the host, so host-side modules are the workstation's version.
+def push_package(remote_src: str) -> str:
+    """Copy this tperf package, the harness included, to <remote_src>/tperf on the host; return the harness version.
 
-    Staged then swapped in, like the harness: a process that already started keeps the modules it imported.
+    Workstation runs push to their own run directory (e.g. f"{rdir}/src") and put it first in the PYTHONPATH of every
+    module they run there (`remote_module`): the daily run's copy (REMOTE_SRC) is only replaced by `tperf deploy`.
+    The harness version (`tperf harness version`) is written to <remote_src>/tperf/harness/VERSION.
     """
-    staging = f"{REMOTE_SRC}/.tperf-{stamp()}-{os.getpid()}"
-    ssh(["mkdir", "-p", staging])
+    version = harness_version()
+    ssh(["mkdir", "-p", f"{remote_src}/tperf"])
     subprocess.run(
         ["rsync", "-a", "--delete", "--exclude=__pycache__", "-e", " ".join(SSH), f"{PKG_SRC}/tperf/",
-         f"{require_host()}:{staging}/"],
+         f"{require_host()}:{remote_src}/tperf/"],
         check=True,
     )  # fmt: skip
-    ssh(f"rm -rf {REMOTE_SRC}/tperf && mv -T {staging} {REMOTE_SRC}/tperf")
+    ssh(f"echo {shlex.quote(version)} >{shlex.quote(remote_src)}/tperf/harness/VERSION")
+    return version
 
 
-def remote_module(python: str, module: str, pythonpath: str = "") -> list[str]:
-    """`env PYTHONPATH=REMOTE_SRC[:pythonpath] <python> -m tperf.<module>`: a host-side module of the pushed package."""
-    path = ":".join(p for p in (REMOTE_SRC, pythonpath) if p)
-    return ["env", f"PYTHONPATH={path}", python, "-m", f"tperf.{module}"]
+def remote_module(python: str, module: str, pythonpath: str) -> list[str]:
+    """`env PYTHONPATH=<pythonpath> <python> -m tperf.<module>`: a host-side module of a pushed package.
+
+    pythonpath starts with the directory the package was pushed to (push_package), then e.g. a transformers src/.
+    """
+    return ["env", f"PYTHONPATH={pythonpath}", python, "-m", f"tperf.{module}"]
 
 
 def run_module(module: str, *args: object, **kwargs) -> subprocess.CompletedProcess:
@@ -182,12 +196,6 @@ def harness_version() -> str:
     from tperf.common.harness import version
 
     return version()
-
-
-def push_harness(remote_dir: str) -> str:
-    from tperf.common.harness import push
-
-    return push(require_host(), remote_dir)
 
 
 def download_model(model: str) -> None:

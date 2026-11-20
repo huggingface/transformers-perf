@@ -1,16 +1,15 @@
 import importlib.util
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
-from harness.framework.benchmark_config import BenchmarkConfig
-from harness.framework.benchmark_runner import BenchmarkRunner
-from harness.framework.data_classes import BenchmarkResult
-from harness.framework.validation import validate_generation_outputs
+from tperf.harness.framework.benchmark_config import BenchmarkConfig
+from tperf.harness.framework.benchmark_runner import BenchmarkRunner
+from tperf.harness.framework.data_classes import BenchmarkResult
+from tperf.harness.framework.validation import validate_generation_outputs
 from transformers import ContinuousBatchingConfig, GenerationConfig
 from transformers.generation.continuous_batching.requests import GenerationOutput, RequestStatus
 
@@ -64,8 +63,7 @@ def suite(monkeypatch):
         "lighteval.tasks.requests",
     ]:
         monkeypatch.setitem(sys.modules, name, Mock())
-    monkeypatch.setattr(sys, "path", sys.path[:])
-    path = Path(__file__).parents[1] / "benchmark_scripts" / "continuous_batching_overall.py"
+    path = importlib.util.find_spec("tperf.harness.benchmark_scripts.continuous_batching_overall").origin
     spec = importlib.util.spec_from_file_location("_failure_suite", path)
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
@@ -179,7 +177,7 @@ def test_monitor_stopped_when_generation_raises():
     runner.model = Mock()
     runner.model.generate.side_effect = RuntimeError("generation failed")
     config = BenchmarkConfig(gpu_monitoring=True, skip_validity_check=True)
-    with patch("harness.framework.benchmark_runner.GPUMonitor") as monitor:
+    with patch("tperf.harness.framework.benchmark_runner.GPUMonitor") as monitor:
         with pytest.raises(RuntimeError, match="generation failed"):
             runner.time_generate(config, warmup=False)
         monitor.return_value.stop_and_collect.assert_called_once()

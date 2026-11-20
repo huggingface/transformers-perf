@@ -164,7 +164,7 @@ class BenchmarkRunner:
         # Those stay constant for the whole run
         self.logger = logger
         if output_dir is None:
-            output_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "benchmark_results")
+            output_dir = os.path.join(os.getcwd(), "benchmark_results")  # not inside the installed package
         self.output_dir = output_dir
         self.branch_name = branch_name
         self.commit_id = get_git_revision() if commit_id is None else commit_id

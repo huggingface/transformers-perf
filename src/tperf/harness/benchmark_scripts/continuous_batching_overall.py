@@ -13,7 +13,6 @@ import argparse
 import gc
 import json
 import os
-import sys
 import time
 import types
 from collections.abc import Callable
@@ -34,14 +33,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, ContinuousBatching
 from transformers.distributed import DistributedConfig
 from transformers.utils.logging import disable_progress_bar
 
-
-# Support launching this file directly as well as importing it as a module.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from framework.validation import validate_generation_outputs  # noqa: E402
+from tperf.harness.framework.validation import validate_generation_outputs
 
 
 # Defaults
-RESULTS_DIR = Path(__file__).parent.parent / "benchmark_results/cb_overall/"
+RESULTS_DIR = Path("benchmark_results/cb_overall/")  # under the current directory
 
 
 # Auxiliary functions

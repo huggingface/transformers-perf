@@ -1,7 +1,7 @@
-diff --git a/harness/framework/benchmark_config.py b/harness/framework/benchmark_config.py
+diff --git a/src/tperf/harness/framework/benchmark_config.py b/src/tperf/harness/framework/benchmark_config.py
 index 7ee2394fd0..265fe797d5 100644
---- a/harness/framework/benchmark_config.py
-+++ b/harness/framework/benchmark_config.py
+--- a/src/tperf/harness/framework/benchmark_config.py
++++ b/src/tperf/harness/framework/benchmark_config.py
 @@ -55,6 +55,25 @@ def is_fa2_or_kernel_available() -> bool:
      return True
  
@@ -94,10 +94,10 @@ index 7ee2394fd0..265fe797d5 100644
              "kernelize": self.kernelize,
              "tp_plan": self.tp_plan,
          }
-diff --git a/harness/framework/benchmark_runner.py b/harness/framework/benchmark_runner.py
+diff --git a/src/tperf/harness/framework/benchmark_runner.py b/src/tperf/harness/framework/benchmark_runner.py
 index 23600cf48d..74202671ed 100644
---- a/harness/framework/benchmark_runner.py
-+++ b/harness/framework/benchmark_runner.py
+--- a/src/tperf/harness/framework/benchmark_runner.py
++++ b/src/tperf/harness/framework/benchmark_runner.py
 @@ -208,9 +208,14 @@ class BenchmarkRunner:
              "max_new_tokens": config.num_tokens_to_generate,
          }

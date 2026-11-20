@@ -14,14 +14,15 @@ dependencies = []
 [project.optional-dependencies]
 # tperf dashboard build (also tperf.ab.compare on the host)
 dashboard = ["huggingface_hub", "pyarrow"]
-# What the host-side modules import in the bench host's venvs (installed there by `tperf host install`)
-host = ["huggingface_hub", "numpy", "nvidia-ml-py", "pillow", "pyarrow", "torch", "transformers"]
+# What the host-side modules (the harness included) import in the bench host's venvs (installed there by
+# `tperf host install`); tperf.harness.benchmark_scripts also needs lighteval and tabulate
+host = ["datasets", "huggingface_hub", "numpy", "nvidia-ml-py", "pillow", "psutil", "pyarrow", "torch", "transformers"]
 
 [project.scripts]
 tperf = "tperf.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/tperf"]  # with its data files: daily/bench-daily.{service,timer}, dashboard/template.html
+packages = ["src/tperf"]  # with tperf.harness and the data files: daily/bench-daily.{service,timer}, dashboard/template.html
 
 [tool.ruff]
 line-length = 119
@@ -29,5 +30,5 @@ target-version = "py311"
 extend-exclude = ["results"]
 
 [tool.pytest.ini_options]
-testpaths = ["harness/tests"]
-pythonpath = ["."]
+testpaths = ["tests"]
+pythonpath = ["src"]

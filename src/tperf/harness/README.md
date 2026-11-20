@@ -21,84 +21,39 @@ The main runner records setup and generation errors in `metadata.error`, continu
 
 ## Quick Start
 
-### Running All Benchmarks
+The harness is part of the `tperf` package (`pip install -e .` at the repository root, or `PYTHONPATH=src`), and runs
+against whatever `import transformers` resolves to: put a checkout's `src/` first on `PYTHONPATH` to benchmark it.
+On the bench host, `tperf ab`, `tperf generation run`, `tperf tp run` and the daily run launch it for you.
 
 ```bash
-# Run all benchmarks with default settings
-python run_benchmarks.py
+# The level-1 scenarios on one model (python -m tperf.harness.run_benchmarks takes the same arguments)
+tperf harness run --model-id meta-llama/Llama-2-7b-hf -b 1 -s 128 -n 64 -w 5 -i 10 --output-dir my_results
 
-# Specify output directory
-python run_benchmarks.py --output-dir my_results
+# Scenarios from a config file instead of a coverage level
+tperf harness run --model-id google/gemma-3-1b-it -b 1 -s 448 -n 128 --config-file scenarios/sliding-window.jsonl \
+    --output-dir my_results
 
-# Run with custom parameters
-python run_benchmarks.py \
-    --warmup-iterations 5 \
-    --measurement-iterations 10 \
-    --num-tokens-to-generate 200
+# Tensor parallelism: launch the module with torchrun
+torchrun --standalone --nproc-per-node 2 -m tperf.harness.run_benchmarks --enable-tp --model-id <model> -b 1 -s 128 -n 64
+
+# Push the results to a Hugging Face dataset (needs a token with write access, e.g. HF_TOKEN)
+tperf harness run --model-id <model> -b 1 -s 128 -n 64 --push-result-to-dataset username/benchmark-results
 ```
 
-### Uploading Results to HuggingFace Dataset
-
-You can automatically upload benchmark results to a HuggingFace Dataset for tracking and analysis:
-
-```bash
-# Upload to a public dataset with auto-generated run ID
-python run_benchmarks.py --upload-to-hub username/benchmark-results
-
-# Upload with a custom run ID for easy identification
-python run_benchmarks.py --upload-to-hub username/benchmark-results --run-id experiment_v1
-
-# Upload with custom HuggingFace token (if not set in environment)
-python run_benchmarks.py --upload-to-hub username/benchmark-results --token hf_your_token_here
-```
-
-**Dataset Directory Structure:**
-```
-dataset_name/
-├── 2025-01-15/
-│   ├── runs/                       # Non-scheduled runs (manual, PR, etc.)
-│   │   └── 123-1245151651/         # GitHub run number and ID
-│   │       └── benchmark_results/
-│   │           ├── benchmark_summary_20250115_143022.json
-│   │           └── model-name/
-│   │               └── model-name_benchmark_20250115_143022.json
-│   └── benchmark_results_abc123de/ # Scheduled runs (daily CI)
-│       ├── benchmark_summary_20250115_143022.json
-│       └── model-name/
-│           └── model-name_benchmark_20250115_143022.json
-└── 2025-01-16/
-    └── ...
-```
-
-**Authentication for Uploads:**
-
-For uploading results, you need a HuggingFace token with write permissions to the target dataset. You can provide the token in several ways (in order of precedence):
-
-1. Command line: `--token hf_your_token_here`
-3. Environment variable: `HF_TOKEN`
-
-### Running Specific Benchmarks
-
-```bash
-# Include only specific benchmarks
-python run_benchmarks.py --include llama
-
-# Exclude specific benchmarks
-python run_benchmarks.py --exclude old_benchmark
-```
+Without `--output-dir`, results go to `benchmark_results/` in the current directory.
 
 ### Comparing Against a Baseline
 
-`compare_results.py` compares a candidate run to a baseline, scenario by scenario, on end-to-end latency, time to first
-token, inter-token latency and throughput. A metric that is worse by more than `--threshold` percent is a regression,
-and the script then exits with status 1, so it can gate CI.
+`tperf harness compare` (`python -m tperf.harness.compare_results`) compares a candidate run to a baseline, scenario
+by scenario, on end-to-end latency, time to first token, inter-token latency and throughput. A metric that is worse by
+more than `--threshold` percent is a regression, and the command then exits with status 1, so it can gate CI.
 
 ```bash
 # Baseline on main, candidate on a branch, same hardware and arguments
-python run_benchmarks.py --model-id meta-llama/Llama-2-7b-hf -b 1 -s 128 -n 128 -w 5 -i 30 --output-dir results_main
-python run_benchmarks.py --model-id meta-llama/Llama-2-7b-hf -b 1 -s 128 -n 128 -w 5 -i 30 --output-dir results_pr
+tperf harness run --model-id meta-llama/Llama-2-7b-hf -b 1 -s 128 -n 128 -w 5 -i 30 --output-dir results_main
+tperf harness run --model-id meta-llama/Llama-2-7b-hf -b 1 -s 128 -n 128 -w 5 -i 30 --output-dir results_pr
 
-python compare_results.py --baseline results_main --candidate results_pr --threshold 1.0
+tperf harness compare --baseline results_main --candidate results_pr --threshold 1.0
 ```
 
 Each side is a results file or a directory of them: with several repeated runs, each metric is the median of the
@@ -162,14 +117,13 @@ Results are saved as JSON files with the following structure:
 ### Debug Mode
 
 ```bash
-python run_benchmarks.py --log-level DEBUG
+tperf harness run --log-level DEBUG ...
 ```
 
-## Contributing
+## Layout
 
-To add new benchmarks:
-
-1. Create a new file in `benches/`
-2. Implement the `ModelBenchmark` interface
-3. Add a runner function (`run_<benchmark_name>` or `run_benchmark`)
-4. run_benchmarks.py
+- `run_benchmarks.py`: the runner (`tperf harness run`); `compare_results.py`: the comparison (`tperf harness compare`)
+- `framework/`: scenario configs, the benchmark runner, hardware metrics, result comparison
+- `benchmark_scripts/continuous_batching_overall.py`: the separate continuous-batching suite (also needs `lighteval`
+  and `tabulate`), run with `python -m tperf.harness.benchmark_scripts.continuous_batching_overall`
+- Tests: `tests/harness/` at the repository root
