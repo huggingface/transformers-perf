@@ -630,10 +630,139 @@ margin:4px 0;font-size:13px}.mem .bar-name{overflow:hidden;text-overflow:ellipsi
 white-space:normal}.mem th{color:var(--muted);font-weight:600;font-size:12px}
 .mem .num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.mem summary{cursor:pointer}
 .mem summary code{white-space:normal;word-break:break-all}.mem a{color:var(--accent)}
+.mem .findings{border:1px solid var(--line);border-left:3px solid var(--c2);border-radius:8px;padding:4px 14px 8px;
+margin:16px 0;background:var(--panel)}.mem .findings.ok{border-left-color:var(--c4);padding:10px 14px}
+.mem .findings h2{margin:8px 0 6px}.mem .findings ul{list-style:none;margin:0;padding:0}
+.mem .findings li{display:flex;gap:10px;align-items:flex-start;padding:6px 0;border-top:1px solid var(--line)}
+.mem .findings li:first-child{border-top:0}.mem .badge{font-size:11px;border-radius:3px;padding:1px 6px;
+margin-top:2px;white-space:nowrap;border:1px solid var(--muted);color:var(--muted)}
+.mem .findings li.warn .badge{border-color:var(--c2);color:var(--c2)}
 .mem .explore{display:flex;flex-wrap:wrap;gap:10px;margin:12px 0}
 .mem .explore a{border:1px solid var(--line);border-radius:6px;padding:8px 12px;text-decoration:none;
 background:var(--panel)}.mem .explore small{display:block;color:var(--muted);font-size:12px}
 """
+
+
+HALF_PRECISION = ("bfloat16", "float16")
+
+
+def findings(profile: dict, gpu: dict | None, host: dict | None) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """Things worth a look, from the counters and summaries: ([(level, title, detail)], [checks that passed]).
+
+    Each check is a plain threshold on numbers the report shows; level is "warn" (likely a bug or a regression to
+    chase) or "info" (unusual, sometimes expected). Thresholds are deliberately loose: a finding should be worth
+    reading on any model."""
+    found: list[tuple[str, str, str]] = []
+    passed: list[str] = []
+    weights = profile.get("weights") or {}
+    load = profile.get("load_memory") or {}
+    marks = {m["name"]: m for m in profile.get("marks") or []}
+    w = weights.get("weights_mb") or 0.0
+
+    def check(name: str, hit: tuple[str, str, str] | None) -> None:
+        if hit:
+            found.append(hit)
+        else:
+            passed.append(name)
+
+    # Model tensors in a second dtype: an fp32 norm, router or buffer in a bf16 model doubles its size
+    by_dtype = weights.get("by_dtype_mb") or {}
+    main = max(by_dtype, key=by_dtype.get) if by_dtype else None
+    minor = {d: mb for d, mb in by_dtype.items() if d != main and mb >= max(1.0, 0.01 * w)}
+    hit = None
+    if minor:
+        dtype, mb = max(minor.items(), key=lambda kv: kv[1])
+        modules = (weights.get("minor_dtype_modules_mb") or {}).get(dtype) or {}
+        where = ", ".join(f"{g} ({fmt_mb(v, 1)})" for g, v in list(modules.items())[:4])
+        level = "warn" if main in HALF_PRECISION and dtype in ("float32", "float64") else "info"
+        hit = (level, f"{fmt_mb(mb, 1)} of model tensors in {dtype}, the rest in {main}",
+               f"In: {where}." if where else "Upcast on load, or kept in full precision on purpose?")  # fmt: skip
+    check("model tensors in one dtype", hit)
+
+    cpu = (weights.get("by_device_mb") or {}).get("cpu", 0)
+    check("weights on the GPU", ("warn", f"{fmt_mb(cpu, 1)} of model tensors left on the CPU",
+          "Offloaded or never moved: every forward copies them, or runs them on the CPU.") if cpu >= 1 else None)  # fmt: skip
+
+    # Host RAM while loading, above what the process held before: about 1× the model is a full copy in host memory
+    start_rss = ((marks.get("start") or {}).get("host") or {}).get("rss_mb")
+    peak = load.get("load_host_peak_rss_mb")
+    hit = None
+    if w and start_rss is not None and peak is not None and (peak - start_rss) > 1.5 * w:
+        added = peak - start_rss
+        hit = ("warn", f"Loading took {fmt_mb(added)} of host RAM at its peak, {added / w:.1f}× the model",
+               "Weights materialized in host memory before moving to the GPU (a copy per tensor, or the whole state "
+               "dict at once). See the mapped and heap tables below.")  # fmt: skip
+    check("host RAM while loading", hit)
+
+    disk = load.get("load_disk_read_mb")
+    check("reads while loading", ("warn", f"Loading read {fmt_mb(disk)} from disk, {disk / w:.1f}× the model",
+          "Files read more than once, or files the model does not need.")
+          if w and disk is not None and disk > 1.5 * w else None)  # fmt: skip
+
+    # Leaks across generations: memory_metrics flushes the cache after each generation, so what stays is held
+    first = marks.get("first generation") or {}
+    last = marks.get("generations") or {}
+    a0, a1 = (first.get("device") or {}).get("allocated_mb"), (last.get("device") or {}).get("allocated_mb")
+    check("GPU memory across generations", ("warn", f"{fmt_mb(a1 - a0, 1)} more GPU memory held after the later "
+          "generations than after the first", "Something keeps tensors between generate calls (a cache, a "
+          "reference in a module attribute).") if a0 is not None and a1 is not None and a1 - a0 > 8 else None)  # fmt: skip
+    h0, h1 = (first.get("host") or {}).get("rss_anon_mb"), (last.get("host") or {}).get("rss_anon_mb")
+    check("host memory across generations", ("warn", f"Host memory grew by {fmt_mb(h1 - h0)} across the later "
+          "generations", "Python or native objects kept between generate calls.")
+          if h0 is not None and h1 is not None and h1 - h0 > 64 else None)  # fmt: skip
+
+    device = last.get("device") or (marks.get("error") or {}).get("device") or {}
+    retries = device.get("alloc_retries") or 0
+    check("allocator retries", ("warn", f"The caching allocator retried {retries} allocation(s)",
+          "It had to free its cache to satisfy a request: memory pressure or fragmentation, and slow.")
+          if retries else None)  # fmt: skip
+
+    if gpu:
+        peak_b = gpu["peak_bytes"]
+        reserved = device.get("peak_reserved_mb")
+        slack = reserved - peak_b / MB if reserved is not None else None
+        check("reserved but unused", ("info", f"{fmt_mb(slack)} reserved but unused at the peak",
+              "Fragmentation in the caching allocator: capacity lost before memory runs out "
+              "(PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True often recovers it).")
+              if slack is not None and slack > max(256, 0.1 * peak_b / MB) else None)  # fmt: skip
+        act = [s for s in gpu["peak_sites"] if s["category"] == "activations & temporaries"]
+        big = max(act, key=lambda s: s["largest"], default=None)
+        check("large temporaries", ("warn", f"One temporary of {fmt_bytes(big['largest'])} at the peak",
+              f"Allocated at {big['site']}: a full-size intermediate (attention scores, logits over the whole "
+              "sequence, an upcast copy)?")
+              if big and big["largest"] / MB > max(256, 0.1 * w) else None)  # fmt: skip
+        temps = (gpu.get("peak_by_category") or {}).get("activations & temporaries", 0) / MB
+        check("activations vs model size", ("warn", f"Activations and temporaries ({fmt_mb(temps)}) exceed the "
+              "model at the peak", "For this batch and length, generation needs more memory than the weights.")
+              if w and temps > w else None)  # fmt: skip
+        compiled = (gpu.get("peak_by_category") or {}).get("compile & CUDA graphs", 0) / MB
+        check("compile and CUDA graph memory", ("info", f"{fmt_mb(compiled)} held by compiled code and CUDA graphs",
+              "Static inputs and graph pools; each recompile can add more.")
+              if w and compiled > 0.25 * w else None)  # fmt: skip
+        check("complete GPU trace", ("warn", "The GPU trace is incomplete (its ring buffer wrapped)",
+              "Totals undercount early allocations: rerun with a larger --max-entries.")
+              if gpu.get("truncated") else None)  # fmt: skip
+    process, reserved_now = last.get("process_gpu_mb"), device.get("reserved_mb")
+    outside = process - reserved_now if process is not None and reserved_now is not None else None
+    check("GPU memory outside torch", ("info", f"{fmt_mb(outside)} of GPU memory outside torch's allocator",
+          "Usually the CUDA context (a few hundred MB): more means library workspaces, another allocator, or a "
+          "second context.") if outside is not None and outside > 1024 else None)  # fmt: skip
+    return found, passed
+
+
+def findings_box(profile: dict, gpu: dict | None, host: dict | None) -> str:
+    found, passed = findings(profile, gpu, host)
+    if not found:
+        return ("<div class='findings ok'><strong>Nothing unusual.</strong> <span class='muted'>Checked: "
+                + esc(", ".join(passed)) + ".</span></div>")  # fmt: skip
+    found.sort(key=lambda f: f[0] != "warn")
+    items = "".join(
+        f"<li class='{esc(level)}'><span class='badge'>{'check' if level == 'warn' else 'note'}</span>"
+        f"<div><strong>{esc(title)}</strong><br><span class='muted'>{esc(detail)}</span></div></li>"
+        for level, title, detail in found
+    )
+    return (f"<div class='findings'><h2>Worth a look</h2><ul>{items}</ul>"
+            f"<p class='note'>Also checked, nothing found: {esc(', '.join(passed))}.</p></div>")  # fmt: skip
 
 
 def title_of(profile: dict) -> str:
@@ -677,6 +806,7 @@ def render_body(profile: dict, gpu: dict | None, host: dict | None, links: dict)
         tile("Read during load", fmt_mb(load.get("load_file_read_mb")),
              f"{fmt_mb(load.get('load_disk_read_mb'))} from disk"),
     ]  # fmt: skip
+    parts.append(findings_box(profile, gpu, host))
     parts.append(f"<div class='tiles'>{''.join(tiles)}</div>")
 
     explore = []
