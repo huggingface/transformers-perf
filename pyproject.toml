@@ -17,7 +17,7 @@ dashboard = ["huggingface_hub", "pyarrow"]
 # What the host-side modules (the harness included) import in the bench host's venvs (installed there by
 # `tperf host install`); tperf.harness.benchmark_scripts also needs lighteval and tabulate
 host = [
-    "datasets", "huggingface_hub", "memray", "numpy", "nvidia-ml-py", "pillow", "psutil", "pyarrow", "torch",
+    "datasets", "huggingface_hub", "memray", "numpy", "nvidia-ml-py", "pillow", "psutil", "py-spy", "pyarrow", "torch",
     "transformers",
 ]
 

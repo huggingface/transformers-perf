@@ -134,6 +134,10 @@ def main() -> None:
     if not succeeds(tbv2_py, "-c", "import memray"):
         log("Installing memray")
         pipv("memray")
+    # py-spy: the python pass of `tperf memory profile` (a binary that samples from outside the process)
+    if not os.access(PREFIX / "tbv2-venv/bin/py-spy", os.X_OK):
+        log("Installing py-spy")
+        pipv("py-spy")
     # kernels: lets harness run flash_attention_2 (kernel fetched from the Hub on first use)
     # and the kernelized scenarios. transformers at TF_COMMIT requires kernels>=0.18.2,<0.19.
     kernels_ok = f"import importlib.metadata as m, sys; sys.exit(m.version('kernels') != '{KERNELS_VERSION}')"

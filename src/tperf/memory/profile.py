@@ -8,10 +8,14 @@ the last generation:
 - GPU pass: the CUDA caching allocator's history (`torch.cuda.memory._record_memory_history`), every allocation and
   free with the Python stack that made it -> gpu_summary.json, gpu_snapshot.pickle.gz (pytorch.org/memory_viz)
 - host pass: memray, native stacks included -> host.memray.bin
+- python pass: no recorder inside, py-spy samples the process from outside (tperf.common.pystacks) -> python.folded,
+  python_summary.json: where the time goes, by function and area of code, per phase. Each phase runs in its own
+  function (_tperf_phase_*), so samples are attributed by their stack, with no clock to line up
 Each pass also reads counters at every phase boundary (tperf.harness.framework.memory_metrics) -> profile.json.
 
-and then writes report.html (tperf.memory.report). Recording slows every allocation down: the timings of this run mean
-nothing, which is why it is a separate command and never part of a measured run.
+and then writes report.html (tperf.memory.report). Recording slows every allocation down: the timings of the GPU and
+host passes mean nothing, which is why this is a separate command and never part of a measured run. The python pass
+is close to real timings (py-spy hooks nothing and takes no GIL), but not a benchmark either: py-spy uses a CPU.
 """
 
 import argparse
@@ -36,7 +40,27 @@ def _tperf_phase_marker(index: int, device: str) -> None:
     torch.empty((index + 1) * MARKER_UNIT, dtype=torch.uint8, device=device)
 
 
-PASSES = ("gpu", "host")  # each pass is its own process: one recorder never measures the other
+PASSES = ("gpu", "host", "python")  # each pass is its own process: one recorder never measures the other
+
+# The python pass's phases: each runs in its own function, so a py-spy sample belongs to the phase on its stack
+PHASE_FUNCTIONS = {
+    "_tperf_phase_load": "load",
+    "_tperf_phase_first_generation": "first generation",
+    "_tperf_phase_generations": "generations",
+}
+
+
+def _tperf_phase_load(runner, model_id: str, config) -> None:
+    runner.setup_benchmark(model_id, config)
+
+
+def _tperf_phase_first_generation(runner, config) -> None:
+    runner.time_generate(config, warmup=True)
+
+
+def _tperf_phase_generations(runner, config, iterations: int) -> None:
+    for _ in range(iterations):
+        runner.time_generate(config, warmup=False)
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -57,6 +81,15 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--stacks", choices=["python", "all"], default="python", help="GPU stacks: all adds C++ frames")
     p.add_argument("--no-memray", action="store_true", help="skip the host pass")
     p.add_argument("--no-native", action="store_true", help="memray without native (C/C++) stacks: much faster")
+    p.add_argument("--no-python", action="store_true", help="skip the python pass (py-spy)")
+    p.add_argument(
+        "--python-iterations",
+        type=int,
+        default=10,
+        help="generations after the first one in the python pass (default 10: enough samples)",
+    )
+    p.add_argument("--python-rate", type=int, default=200, help="py-spy samples per second (default 200)")
+    p.add_argument("--python-native", action="store_true", help="py-spy with native (C/C++) frames: slower sampling")
     p.add_argument("--memray-all", action="store_true", help="keep every host allocation (large file; temporal views)")
     p.add_argument("--keep-snapshot", action=argparse.BooleanOptionalAction, default=False,
                    help="also keep the raw gpu_snapshot.pickle (hundreds of MB): gpu_snapshot.pickle.gz, without the "
@@ -78,21 +111,37 @@ def main(argv: list[str] | None = None) -> None:
         return record(a)
     a.out.mkdir(parents=True, exist_ok=True)
     errors = []
+    from tperf.common import pystacks
+
     for name in PASSES:
-        if name == "host" and a.no_memray:
+        if (name == "host" and a.no_memray) or (name == "python" and a.no_python):
             continue
+        command = [sys.executable, "-m", "tperf.memory.profile", *argv, "--record", name]
+        if name == "python":
+            pyspy = pystacks.find_pyspy(sys.executable)
+            if pyspy is None:
+                print("py-spy is not installed: no python pass (pip install py-spy)", file=sys.stderr)
+                continue
+            folded = a.out / "python.folded"
+            folded.unlink(missing_ok=True)
+            command = (
+                pystacks.record_command(folded, rate=a.python_rate, native=a.python_native, pyspy=pyspy) + command
+            )
         print(f"{name} pass", file=sys.stderr, flush=True)
-        rc = subprocess.run([sys.executable, "-m", "tperf.memory.profile", *argv, "--record", name]).returncode
+        rc = subprocess.run(command).returncode
         if rc:
             errors.append(f"{name} pass exited {rc}")
     passes = {n: json.loads(f.read_text()) for n in PASSES if (f := a.out / f"profile.{n}.json").exists()}
     if not passes:
         sys.exit(f"no pass recorded anything: {'; '.join(errors)}")
-    profile = dict(passes.get("host") or passes["gpu"])
+    profile = dict(passes.get("host") or passes.get("gpu") or passes["python"])
     if "gpu" in passes:
         profile["gpu_marks"] = passes["gpu"]["marks"]
         for key in ("gpu_name", "gpu_memory_total_mb"):
             profile[key] = passes["gpu"].get(key)
+    if "python" in passes:
+        profile["python_marks"] = passes["python"]["marks"]
+        write_python_summary(a, passes["python"])
     profile["passes"] = sorted(passes)
     profile["error"] = "; ".join(filter(None, [*(p.get("error") for p in passes.values()), *errors])) or None
     (a.out / "profile.json").write_text(json.dumps(profile, indent=1, default=str))
@@ -102,6 +151,29 @@ def main(argv: list[str] | None = None) -> None:
     print(build(a.out))
     if profile["error"]:
         sys.exit(f"scenario failed: {profile['error']} (report written with what was recorded)")
+
+
+def write_python_summary(a: argparse.Namespace, python_pass: dict) -> None:
+    """python_summary.json from python.folded: per phase, where the time went, with the phase's wall time and the
+    tokens it generated (for per-token figures)."""
+    from tperf.common import pystacks
+
+    folded = a.out / "python.folded"
+    if not folded.exists():
+        return
+    summary = pystacks.summarize(pystacks.parse_raw(folded.read_text()), a.python_rate, phases=PHASE_FUNCTIONS)
+    marks = python_pass.get("marks") or []
+    walls = {cur["name"]: (cur["time_ms"] - prev["time_ms"]) / 1e3 for prev, cur in zip(marks, marks[1:])}
+    per_generation = a.batch_size * a.num_tokens_to_generate
+    wall_of = {"load": walls.get("loaded"), "first generation": walls.get("first generation"),
+               "generations": walls.get("generations")}  # fmt: skip
+    tokens_of = {"first generation": per_generation, "generations": per_generation * a.python_iterations}
+    for g in summary["groups"]:
+        g["wall_seconds"] = wall_of.get(g["name"])
+        g["tokens"] = tokens_of.get(g["name"])
+    summary["native"] = a.python_native
+    summary["iterations"] = a.python_iterations
+    (a.out / "python_summary.json").write_text(json.dumps(summary, indent=1))
 
 
 def scenario_config(a: argparse.Namespace):
@@ -145,6 +217,7 @@ def record(a: argparse.Namespace) -> None:
     accelerator = torch.cuda if cuda else None
     gpu_pass = a.record == "gpu" and cuda
     config = scenario_config(a)
+    iterations = a.python_iterations if a.record == "python" else a.iterations
     marks: list[dict] = []
 
     def mark(name: str) -> None:
@@ -178,13 +251,12 @@ def record(a: argparse.Namespace) -> None:
     try:
         with torch.no_grad():
             mark("start")
-            runner.setup_benchmark(a.model_id, config)
+            _tperf_phase_load(runner, a.model_id, config)
             mark("loaded")
             weights = model_breakdown(runner.model)
-            runner.time_generate(config, warmup=True)
+            _tperf_phase_first_generation(runner, config)
             mark("first generation")
-            for _ in range(a.iterations):
-                runner.time_generate(config, warmup=False)
+            _tperf_phase_generations(runner, config, iterations)
             mark("generations")
     except Exception as e:  # keep what was recorded: the report shows how far it got
         error = repr(e)

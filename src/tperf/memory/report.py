@@ -3,10 +3,11 @@
     python -m tperf.memory.report <profile dir>
     tperf memory report <profile dir>
 
-Reads profile.json (phase counters, the model's tensors), gpu_snapshot.pickle (the CUDA allocator's history) and
-host.memray.bin (memray), each optional. Shows, per device: memory over time by category with the phase boundaries,
-then what held memory at the peak, grouped by the code that allocated it, with its stack. Also writes
-host-flamegraph.html (memray's own) next to it when memray is installed.
+Reads profile.json (phase counters, the model's tensors), gpu_snapshot.pickle (the CUDA allocator's history),
+host.memray.bin (memray) and python_summary.json (py-spy, tperf.common.pystacks), each optional. Shows, per device:
+memory over time by category with the phase boundaries, then what held memory at the peak, grouped by the code that
+allocated it, with its stack; then where the Python time went, per phase. Also writes host-flamegraph.html (memray's
+own) next to it when memray is installed.
 
 Only the standard library is needed for the GPU part; the host part imports memray.
 """
@@ -646,7 +647,9 @@ background:var(--panel)}.mem .explore small{display:block;color:var(--muted);fon
 HALF_PRECISION = ("bfloat16", "float16")
 
 
-def findings(profile: dict, gpu: dict | None, host: dict | None) -> tuple[list[tuple[str, str, str]], list[str]]:
+def findings(
+    profile: dict, gpu: dict | None, host: dict | None, python: dict | None = None
+) -> tuple[list[tuple[str, str, str]], list[str]]:
     """Things worth a look, from the counters and summaries: ([(level, title, detail)], [checks that passed]).
 
     Each check is a plain threshold on numbers the report shows; level is "warn" (likely a bug or a regression to
@@ -747,11 +750,18 @@ def findings(profile: dict, gpu: dict | None, host: dict | None) -> tuple[list[t
     check("GPU memory outside torch", ("info", f"{fmt_mb(outside)} of GPU memory outside torch's allocator",
           "Usually the CUDA context (a few hundred MB): more means library workspaces, another allocator, or a "
           "second context.") if outside is not None and outside > 1024 else None)  # fmt: skip
+
+    gens = python_group(python, "generations")
+    if gens and gens["seconds"]:
+        compiling = gens["by_area"].get("torch.compile", 0)
+        check("no compilation in the measured generations", ("warn", f"{compiling:.2f} s of the later generations in "
+              "torch.compile code", "Recompiling or guard checks after the first generation: a dynamic shape, or a "
+              "guard that changes between calls.") if compiling > 0.05 * gens["seconds"] else None)  # fmt: skip
     return found, passed
 
 
-def findings_box(profile: dict, gpu: dict | None, host: dict | None) -> str:
-    found, passed = findings(profile, gpu, host)
+def findings_box(profile: dict, gpu: dict | None, host: dict | None, python: dict | None = None) -> str:
+    found, passed = findings(profile, gpu, host, python)
     if not found:
         return ("<div class='findings ok'><strong>Nothing unusual.</strong> <span class='muted'>Checked: "
                 + esc(", ".join(passed)) + ".</span></div>")  # fmt: skip
@@ -765,11 +775,94 @@ def findings_box(profile: dict, gpu: dict | None, host: dict | None) -> str:
             f"<p class='note'>Also checked, nothing found: {esc(', '.join(passed))}.</p></div>")  # fmt: skip
 
 
+# ------------------------------------------------------------------------------------------------------------- Python
+
+PYTHON_PHASES = ("generations", "first generation", "load", "other")
+TOP_FUNCTIONS = 25
+
+
+def python_group(python: dict | None, name: str) -> dict | None:
+    return next((g for g in (python or {}).get("groups", []) if g["name"] == name), None)
+
+
+def time_bars(items: dict[str, float], total: float) -> str:
+    rows = []
+    for name, sec in sorted(items.items(), key=lambda kv: -kv[1]):
+        pct = sec / total * 100 if total else 0
+        if pct < 0.5:
+            continue
+        rows.append(
+            f'<div class="bar-row"><span class="bar-name">{esc(name)}</span>'
+            f'<span class="bar-track"><span class="bar-fill" style="width:{pct:.1f}%;background:var(--accent)"></span>'
+            f'</span><span class="bar-val">{sec:,.2f} s <small>{pct:.0f}%</small></span></div>'
+        )
+    return "".join(rows) or '<p class="muted">Nothing recorded.</p>'
+
+
+def functions_table(rows: list[dict], total: float, tokens: int | None, what: str) -> str:
+    body = []
+    for r in rows[:TOP_FUNCTIONS]:
+        pct = r["seconds"] / total * 100 if total else 0
+        per_token = f"{r['seconds'] / tokens * 1e3:,.3f}" if tokens else "–"
+        body.append(f"<tr><td class='num'>{r['seconds']:,.3f} s</td><td class='num'>{pct:.1f}%</td>"
+                    f"<td class='num'>{per_token}</td><td>{esc(r['area'])}</td>"
+                    f"<td><code>{esc(r['function'])}</code></td></tr>")  # fmt: skip
+    return (
+        "<div class='table-wrap'><table><thead><tr><th class='num'>Time</th><th class='num'>Share</th>"
+        f"<th class='num'>ms / token</th><th>Area</th><th>{esc(what)}</th></tr></thead>"
+        f"<tbody>{''.join(body)}</tbody></table></div>"
+    )
+
+
+def python_section(python: dict | None, links: dict) -> str:
+    parts = ["<h2>Python time</h2>"]
+    if not python:
+        parts.append("<p class='muted'>No python pass (run without <code>--no-python</code>, with py-spy installed)."
+                     "</p>")  # fmt: skip
+        return "".join(parts)
+    parts.append(
+        f"<p class='note'>py-spy sampled every thread of a separate run at {python['rate']} Hz from outside the "
+        "process (no hooks, no GIL taken), so these durations are close to real ones, though not benchmark timings: "
+        "py-spy uses a CPU. Time inside a C call (a torch "
+        "op, a CUDA synchronization) is charged to the Python line that made it"
+        + (", with native frames below it" if python.get("native") else "")
+        + ". Threads add up: sampled time can exceed wall time. Per token: divided by the tokens the phase generated "
+        "(batch × new tokens × generations).</p>"
+    )
+    groups = sorted(python.get("groups", []), key=lambda g: PYTHON_PHASES.index(g["name"])
+                    if g["name"] in PYTHON_PHASES else len(PYTHON_PHASES))  # fmt: skip
+    for g in groups:
+        tokens = g.get("tokens")
+        wall = g.get("wall_seconds")
+        tiles = [tile("Sampled", f"{g['seconds']:,.2f} s", f"{g['samples']:,} samples")]
+        if wall:
+            tiles.append(tile("Wall time", f"{wall:,.2f} s", "between the phase's boundaries"))
+        if tokens and wall:
+            tiles.append(tile("Per token", f"{wall / tokens * 1e3:,.2f} ms", f"{tokens:,} tokens"))
+        open_attr = " open" if g["name"] == "generations" else ""
+        parts.append(
+            f"<details class='card' style='margin:10px 0'{open_attr}><summary><strong>{esc(g['name'])}</strong> "
+            f"<span class='muted'>{g['seconds']:,.2f} s sampled</span></summary>"
+            f"<div class='tiles'>{''.join(tiles)}</div>"
+            "<h3>By area of code (innermost frame)</h3>"
+            + time_bars(g["by_area"], g["seconds"])
+            + "<h3>Self: the lines the samples were in</h3>"
+            + functions_table(g["self"], g["seconds"], tokens, "Line")
+            + "<h3>Inclusive: functions on the stack, and everything they called</h3>"
+            + functions_table(g["inclusive"], g["seconds"], tokens, "Function")
+            + "</details>"
+        )
+    if links.get("python_stacks"):
+        parts.append(f"<p>All stacks: <a href='{esc(links['python_stacks'])}'>{esc(links['python_stacks'])}</a> "
+                     "(folded stacks: open in <a href='https://www.speedscope.app'>speedscope.app</a>).</p>")  # fmt: skip
+    return "".join(parts)
+
+
 def title_of(profile: dict) -> str:
     return f"Memory profile: {profile.get('model_id', '?')}"
 
 
-def render_body(profile: dict, gpu: dict | None, host: dict | None, links: dict) -> str:
+def render_body(profile: dict, gpu: dict | None, host: dict | None, links: dict, python: dict | None = None) -> str:
     """The report's content, inside <div class="mem">: every value from the data is escaped, and there is no script.
 
     links: "flamegraph" and "memory_viz" (URLs, or absent), "files" ([(name, what)] listed at the end)."""
@@ -806,7 +899,7 @@ def render_body(profile: dict, gpu: dict | None, host: dict | None, links: dict)
         tile("Read during load", fmt_mb(load.get("load_file_read_mb")),
              f"{fmt_mb(load.get('load_disk_read_mb'))} from disk"),
     ]  # fmt: skip
-    parts.append(findings_box(profile, gpu, host))
+    parts.append(findings_box(profile, gpu, host, python))
     parts.append(f"<div class='tiles'>{''.join(tiles)}</div>")
 
     explore = []
@@ -913,6 +1006,8 @@ def render_body(profile: dict, gpu: dict | None, host: dict | None, links: dict)
             + sites_table(host["mmap_sites"], host["peak_bytes"], show_allocators=True)
         )  # fmt: skip
 
+    parts.append(python_section(python, links))
+
     if links.get("files"):
         parts.append(
             "<h2>Files</h2><ul>"
@@ -925,19 +1020,25 @@ def render_body(profile: dict, gpu: dict | None, host: dict | None, links: dict)
     return "".join(parts)
 
 
-def render(profile: dict, gpu: dict | None, host: dict | None, links: dict) -> str:
+def render(profile: dict, gpu: dict | None, host: dict | None, links: dict, python: dict | None = None) -> str:
     """A standalone page."""
     return (
         f"<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' "
         f"content='width=device-width,initial-scale=1'><title>{esc(title_of(profile))}</title>"
-        f"<style>{TOKENS}{RULES}</style></head><body>{render_body(profile, gpu, host, links)}</body></html>"
+        f"<style>{TOKENS}{RULES}</style></head><body>{render_body(profile, gpu, host, links, python)}</body></html>"
     )
 
 
-def render_fragment(profile: dict, gpu: dict | None, host: dict | None, links: dict) -> dict:
+def render_fragment(
+    profile: dict, gpu: dict | None, host: dict | None, links: dict, python: dict | None = None
+) -> dict:
     """For a host page with its own header and styles (the Transformers CI dashboard): {title, css, body}. The body
     has no script and escapes every value, so the host page can inline it."""
-    return {"title": title_of(profile), "css": SITE_TOKENS + RULES, "body": render_body(profile, gpu, host, links)}
+    return {
+        "title": title_of(profile),
+        "css": SITE_TOKENS + RULES,
+        "body": render_body(profile, gpu, host, links, python),
+    }
 
 
 def load_summaries(profile_dir: Path) -> tuple[dict, dict | None, dict | None]:
@@ -948,6 +1049,12 @@ def load_summaries(profile_dir: Path) -> tuple[dict, dict | None, dict | None]:
         return json.loads(path.read_text()) if path.exists() else None
 
     return read("profile.json"), read("gpu_summary.json"), read("host_summary.json")
+
+
+def load_python_summary(profile_dir: Path) -> dict | None:
+    """python_summary.json of a profile directory (absent before the python pass existed, or without py-spy)."""
+    path = Path(profile_dir) / "python_summary.json"
+    return json.loads(path.read_text()) if path.exists() else None
 
 
 def build(profile_dir: Path) -> Path:
@@ -986,8 +1093,14 @@ def build(profile_dir: Path) -> Path:
             print("memray is not installed: host section from host_summary.json, if any", file=sys.stderr)
     if host is None and host_summary.exists():
         host = json.loads(host_summary.read_text())
+    python = load_python_summary(profile_dir)
+    if python is not None:
+        files.append(("python_summary.json", "the python pass: time by phase, area of code and function"))
+    if (profile_dir / "python.folded").exists():
+        links["python_stacks"] = "python.folded"
+        files.append(("python.folded", "py-spy's stacks, folded (speedscope.app, flamegraph.pl)"))
     out = profile_dir / "report.html"
-    out.write_text(render(profile, gpu, host, links))
+    out.write_text(render(profile, gpu, host, links, python))
     return out
 
 

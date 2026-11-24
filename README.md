@@ -37,7 +37,10 @@ model's tensors by dtype, what load read from disk versus the page cache and its
 file-backed), each phase's GPU working set above the weights, the allocator's peak reserve and retries, and what NVML
 charges the process. These say how much, not what: `tperf memory profile` reruns one scenario with every GPU and host
 allocation recorded and writes an HTML report of what held memory at the peak and which code allocated it. Its
-timings mean nothing, so it is never part of a measured run.
+timings mean nothing, so it is never part of a measured run. The same report has a *Python time* section: a third
+run under [py-spy](https://github.com/benfred/py-spy), sampled from outside the process, splits load, first
+generation and later generations by area of code (generation loop, model code, cache, torch, compile) and by line,
+with milliseconds per generated token: where host-side overhead comes from, which latency numbers alone cannot show.
 
 ### Coverage and how to read a result
 
@@ -84,7 +87,7 @@ tperf processors run                   # processors and encoders
 tperf baselines run                    # GEMM and host<->device bandwidth
 MODEL=meta-llama/Llama-2-7b-hf NCORES=6 tperf noise soak --hours 3   # how noisy is this host? (run on two, then
                                        #   tperf noise summarize <soak> <soak>)
-MODEL=google/gemma-3-1b-it tperf memory profile 49542   # where memory goes, as results/<ts>-memory/profile/report.html
+MODEL=google/gemma-3-1b-it tperf memory profile 49542   # memory and Python time: results/<ts>-memory/profile/report.html
 tperf --help                           # every command
 ```
 

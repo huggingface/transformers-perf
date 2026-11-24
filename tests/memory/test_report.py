@@ -206,3 +206,38 @@ def test_findings_flag_what_looks_wrong_and_list_what_passed():
                      "Host memory grew", "retried 3", "One temporary of 600"):  # fmt: skip
         assert expected in titles, (expected, titles)
     assert "model.layers.*.mlp.router" in findings_box(bad, gpu, None)
+
+
+def test_python_section_and_compile_finding(tmp_path):
+    from tperf.common.pystacks import parse_raw, summarize
+    from tperf.memory.profile import PHASE_FUNCTIONS
+    from tperf.memory.report import findings, render_fragment
+
+    raw = (
+        "<module> (/r/src/tperf/memory/profile.py:1);_tperf_phase_generations (/r/src/tperf/memory/profile.py:2);"
+        f"generate ({TF}/generation/utils.py:2000);_fn (/venv/torch/_dynamo/eval_frame.py:600) 30\n"
+        "<module> (/r/src/tperf/memory/profile.py:1);_tperf_phase_generations (/r/src/tperf/memory/profile.py:2);"
+        f"generate ({TF}/generation/utils.py:2000);forward ({TF}/models/llama/modeling_llama.py:9) 70\n"
+    )
+    python = summarize(parse_raw(raw), rate=100, phases=PHASE_FUNCTIONS)
+    python["groups"][0].update(wall_seconds=1.2, tokens=640)
+    profile = {"model_id": "m", "marks": []}
+    found, passed = findings(profile, None, None, python)
+    assert any("torch.compile" in title for _, title, _ in found)
+    body = render_fragment(profile, None, None, {"python_stacks": "python.folded"}, python)["body"]
+    assert "Python time" in body and "transformers models" in body and "python.folded" in body
+    assert "1.875 ms" not in body and "1.88 ms" in body  # wall per token: 1.2 s / 640
+    # without a python summary the section says why, and the other findings still run
+    assert "No python pass" in render_fragment(profile, None, None, {})["body"]
+
+
+def test_build_reads_python_summary(tmp_path):
+    (tmp_path / "profile.json").write_text(json.dumps({"model_id": "m", "marks": []}))
+    (tmp_path / "python_summary.json").write_text(json.dumps(
+        {"rate": 100, "samples": 10, "seconds": 0.1, "groups": [
+            {"name": "generations", "samples": 10, "seconds": 0.1, "by_area": {"torch": 0.1},
+             "self": [{"function": "torch/x.py:1 f", "area": "torch", "samples": 10, "seconds": 0.1}],
+             "inclusive": []}]}))  # fmt: skip
+    (tmp_path / "python.folded").write_text("f (/x/torch/x.py:1) 10\n")
+    html = build(tmp_path).read_text()
+    assert "torch/x.py:1 f" in html and "speedscope" in html
