@@ -134,7 +134,11 @@ def main() -> None:
     if not succeeds(tbv2_py, "-c", "import memray"):
         log("Installing memray")
         pipv("memray")
-    # py-spy: the python pass of `tperf memory profile` (a binary that samples from outside the process)
+    # transformers' `serving` extra: `tperf serve` starts `transformers serve` from the harness venv
+    if not succeeds(tbv2_py, "-c", "import fastapi, openai, pydantic, uvicorn"):
+        log("Installing transformers' serving dependencies")
+        pipv("fastapi", "openai", "pydantic", "uvicorn", "starlette", "rich")
+    # py-spy: the python pass of `tperf memory profile` and `tperf serve --profile` (samples from outside the process)
     if not os.access(PREFIX / "tbv2-venv/bin/py-spy", os.X_OK):
         log("Installing py-spy")
         pipv("py-spy")

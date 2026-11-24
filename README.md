@@ -42,6 +42,15 @@ run under [py-spy](https://github.com/benfred/py-spy), sampled from outside the 
 generation and later generations by area of code (generation loop, model code, cache, torch, compile) and by line,
 with milliseconds per generated token: where host-side overhead comes from, which latency numbers alone cannot show.
 
+**Serving.** `tperf serve run` starts a real `transformers serve` on one GPU and plays multi-turn conversations
+against its OpenAI API with streaming, as a chat client does: each turn resends the whole history, so the prompt, and
+time to first token, grow turn after turn. Per turn it reports TTFT, decode speed, inter-token latency, stalls between
+streamed chunks and server memory, plus TTFT's cost per 1k prompt tokens (re-reading the history); `tperf serve
+summarize <base> <run>` compares two runs turn by turn. `--profile` attaches py-spy to the server for the measured
+conversations: busy time per server thread (the event loop, the inference thread) by area of code, including the
+serving layer's own. Scenarios: [serve-multiturn.jsonl](scenarios/serve-multiturn.jsonl) (SDPA, long context,
+continuous batching with four conversations at once, compiled). `tperf serve bench` runs the same on any machine.
+
 ### Coverage and how to read a result
 
 The checked-in [daily suites](src/tperf/daily/main.py) currently run Llama-2-7B (128 input / 64 output tokens) and
@@ -59,7 +68,7 @@ variation before interpreting small changes.
 The tooling also supports targeted tensor-parallel, continuous-batching, and hardware-baseline experiments
 (GEMM, host/device and peer-to-peer transfers, NCCL). Their availability does not mean every configuration runs daily.
 Continuous-batching call latency includes manager creation and warm-up, so it should not be read as persistent-server
-request latency.
+request latency: `tperf serve` measures that.
 
 For more detail:
 
@@ -88,6 +97,7 @@ tperf baselines run                    # GEMM and host<->device bandwidth
 MODEL=meta-llama/Llama-2-7b-hf NCORES=6 tperf noise soak --hours 3   # how noisy is this host? (run on two, then
                                        #   tperf noise summarize <soak> <soak>)
 MODEL=google/gemma-3-1b-it tperf memory profile 49542   # memory and Python time: results/<ts>-memory/profile/report.html
+MODEL=Qwen/Qwen3-0.6B tperf serve run main      # multi-turn chat against transformers serve (scenarios/serve-*.jsonl)
 tperf --help                           # every command
 ```
 

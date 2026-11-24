@@ -36,6 +36,14 @@ COMMANDS: dict[str, dict[str, tuple[str, str]]] = {
         "profile": ("tperf.memory.run", "where memory goes in one scenario: HTML report"),
         "report": ("tperf.memory.report", "rebuild report.html from a profile directory"),
     },
+    "serve": {
+        "run": (
+            "tperf.serve.run",
+            "multi-turn chat against transformers serve on the host: tperf serve run [pr|main]",
+        ),
+        "bench": ("tperf.serve.bench", "the same, here (any machine): start transformers serve, play conversations"),
+        "summarize": ("tperf.serve.summarize", "print serve results, or compare runs turn by turn"),
+    },
     "baselines": {
         "run": ("tperf.baselines.run", "bf16 GEMM and host<->device bandwidth"),
         "repeat": ("tperf.baselines.repeat", "repeat the baselines and compare the runs"),

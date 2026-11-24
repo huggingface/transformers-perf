@@ -1,0 +1,6 @@
+# Multi-turn chat against `transformers serve` (tperf serve run / tperf.serve.bench): fields are tperf.serve.bench
+# arguments. Every turn resends the whole history, so TTFT grows with the conversation; replies are fixed-length.
+{"name": "chat", "turns": 8, "system_tokens": 256, "user_tokens": 64, "max_tokens": 64, "conversations": 3, "server_args": "--attn-implementation sdpa"}
+{"name": "chat-long", "turns": 12, "system_tokens": 1024, "user_tokens": 192, "max_tokens": 128, "conversations": 2, "server_args": "--attn-implementation sdpa"}
+{"name": "chat-cb-4", "turns": 8, "system_tokens": 256, "user_tokens": 64, "max_tokens": 64, "conversations": 8, "concurrency": 4, "server_args": "--continuous-batching --attn-implementation sdpa"}
+{"name": "chat-compile", "turns": 8, "system_tokens": 256, "user_tokens": 64, "max_tokens": 64, "conversations": 3, "server_args": "--compile --attn-implementation sdpa"}
