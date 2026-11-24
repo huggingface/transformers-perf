@@ -65,9 +65,9 @@ def sample(cpus: list[int]) -> dict:
 
 
 def stats(vals: list[float]) -> dict[str, float]:
-    med = statistics.median(vals)
+    med, mean = statistics.median(vals), statistics.fmean(vals)
     sd = statistics.stdev(vals) if len(vals) > 1 else 0.0
-    return {"median": med, "min": min(vals), "max": max(vals), "cov_pct": 100 * sd / med if med else 0.0}
+    return {"median": med, "min": min(vals), "max": max(vals), "cov_pct": 100 * sd / mean if mean else 0.0}  # sd/mean
 
 
 def probe(cpus: list[int], reps: int) -> dict:

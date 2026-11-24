@@ -36,8 +36,10 @@ The first "apply" saves the original state to /var/lib/bench-prep/ so "revert" c
 """
 
 import argparse
+import fcntl
 import glob
 import itertools
+import json
 import os
 import re
 import shlex
@@ -45,6 +47,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -52,6 +55,9 @@ STATE_DIR = Path("/var/lib/bench-prep")
 UNIT_STATE = STATE_DIR / "units.orig"
 RUNTIME_STATE = STATE_DIR / "runtime.orig"
 REPORT_FILE = STATE_DIR / "report.txt"  # what the last "apply" did and could not do; shown by "status"
+ORIG_STATE = STATE_DIR / "orig.json"  # original sysctl values, idle states, IRQ affinities, GPU persistence mode
+LOCK_FILE = "/run/bench-prep.lock"  # apply and revert never run at the same time
+GRUB_CFG = Path("/boot/grub/grub.cfg")
 SYSCTL_FILE = Path("/etc/sysctl.d/99-bench.conf")
 APT_FILE = Path("/etc/apt/apt.conf.d/99-bench-no-auto")
 BOOT_UNIT = "bench-tuning.service"
@@ -143,10 +149,11 @@ def disable_deep_cstates(check=True):
 
 
 def irq_affinity(hk, gpu_map):
-    """Route all interrupts to the housekeeping CPUs `hk` (one per NUMA node, indexed by node), and each GPU's
-    interrupts to the housekeeping CPU of its node (`gpu_map`: GPU index -> node)."""
+    """Route all interrupts to the housekeeping CPUs (`hk`: NUMA node -> its housekeeping CPU list, e.g.
+    {"0": "0,8"}), and each GPU's interrupts to the housekeeping CPUs of its node (`gpu_map`: GPU index -> node)."""
+    every = ",".join(hk.values())
     for irq in glob.glob("/proc/irq/[0-9]*"):
-        write(f"{irq}/smp_affinity_list", ",".join(hk), check=False)
+        write(f"{irq}/smp_affinity_list", every, check=False)
     # NVIDIA display/3D controllers in PCI bus order, which is nvidia-smi's GPU index order.
     i = 0
     for dev in sorted(glob.glob("/sys/bus/pci/devices/*")):
@@ -156,8 +163,7 @@ def irq_affinity(hk, gpu_map):
             continue
         if vendor != "0x10de" or not cls.startswith("0x03"):
             continue
-        node = int(gpu_map[i]) if i < len(gpu_map) else 0
-        cpu = hk[node] if node < len(hk) else ""
+        cpu = hk.get(str(gpu_map[i]), every) if i < len(gpu_map) else every
         msi = f"{dev}/msi_irqs"
         for irq in sorted(os.listdir(msi)) if os.path.isdir(msi) else []:
             write(f"/proc/irq/{irq}/smp_affinity_list", cpu, check=False)
@@ -271,6 +277,35 @@ def lines(text: str) -> list[str]:
     return parts[:-1] if parts[-1] == "" else parts
 
 
+def parse_cpulist(spec: str) -> set[int]:
+    """ "0-3,8-11" -> {0, 1, 2, 3, 8, 9, 10, 11}; "" -> set()."""
+    cpus: set[int] = set()
+    for part in spec.strip().split(","):
+        if part:
+            lo, _, hi = part.partition("-")
+            cpus.update(range(int(lo), int(hi or lo) + 1))
+    return cpus
+
+
+def housekeeping(lscpu: str) -> dict[str, list[int]]:
+    """NUMA node -> the CPUs of its first core (every SMT thread of it), from `lscpu -p=CPU,CORE,NODE`. A benchmark
+    CPU never shares a core with housekeeping, and node IDs need not be contiguous."""
+    first_core: dict[str, str] = {}
+    hk: dict[str, list[int]] = {}
+    for line in lines(lscpu):
+        if line.startswith("#") or not line.strip():
+            continue
+        cpu, core, node = line.split(",")[:3]
+        node = node or "0"
+        if first_core.setdefault(node, core) == core:
+            hk.setdefault(node, []).append(int(cpu))
+    return hk
+
+
+def all_cpus(lscpu: str) -> set[int]:
+    return {int(line.split(",")[0]) for line in lines(lscpu) if line.strip() and not line.startswith("#")}
+
+
 def indented(text: str) -> None:
     for line in lines(text):
         print(f"   {line}")
@@ -302,6 +337,33 @@ def save_unit_state() -> None:
     thp_enabled = "".join(re.findall(r"\[([a-z]*)\]", read(f"{THP}/enabled")))
     thp_defrag = "".join(re.findall(r"\[([a-z+]*)\]", read(f"{THP}/defrag")))
     RUNTIME_STATE.write_text(f"thp_enabled {thp_enabled}\nthp_defrag {thp_defrag}\nksm_run {read(KSM_RUN, '0')}\n")
+
+
+def save_orig_state(first_apply: bool) -> None:
+    """Original values of what apply changes in place, written once, before anything is changed, so revert can
+    restore them. A host tuned before this snapshot existed has no originals left to read: say so instead of
+    recording tuned values as original."""
+    if ORIG_STATE.is_file():
+        return
+    if not first_apply:
+        ORIG_STATE.write_text(json.dumps({"complete": False}))
+        note(
+            "host tuned before original values were recorded: revert resets sysctls, idle states and IRQs to defaults"
+        )
+        return
+    state: dict = {"complete": True, "sysctl": {}, "cpuidle": {}, "irq": {}, "gpu_persistence": []}
+    for k in SYSCTLS:
+        v = output("sysctl", "-n", k, fallback="")
+        if v:
+            state["sysctl"][k] = v
+    for path in glob.glob("/sys/devices/system/cpu/cpu*/cpuidle/state*/disable"):
+        state["cpuidle"][path] = read(path, "")
+    for path in glob.glob("/proc/irq/[0-9]*/smp_affinity_list"):
+        state["irq"][path] = read(path, "")
+    if nvidia_ok():
+        modes = output("nvidia-smi", "--query-gpu=persistence_mode", "--format=csv,noheader", fallback="")
+        state["gpu_persistence"] = [m.strip() for m in lines(modes)]
+    ORIG_STATE.write_text(json.dumps(state))
 
 
 def apply_units() -> None:
@@ -344,19 +406,21 @@ def apply_apt() -> None:
     )
 
 
+# key: (tuned value, why, kernel default). Removing the sysctl.d file does not undo a value: `sysctl --system` only
+# applies the files that remain, so revert writes the recorded original, or this default when none was recorded.
+SYSCTLS = {
+    "kernel.numa_balancing": ("0", "No automatic NUMA page migration: pin with numactl instead.", "1"),
+    "kernel.randomize_va_space": ("0", "Deterministic memory layout across runs.", "2"),
+    "kernel.watchdog": ("0", "No soft/hard lockup watchdog timers.", "1"),
+    "kernel.nmi_watchdog": ("0", "No NMI watchdog.", "1"),
+    "vm.stat_interval": ("10", "Update VM stats every 10s instead of every 1s.", "1"),
+}
+
+
 def apply_sysctl() -> None:
     log(f"Applying kernel sysctls ({SYSCTL_FILE})")
     SYSCTL_FILE.write_text(
-        "# Written by tperf/host/prepare.py\n"
-        "# No automatic NUMA page migration: pin with numactl instead.\n"
-        "kernel.numa_balancing = 0\n"
-        "# Deterministic memory layout across runs.\n"
-        "kernel.randomize_va_space = 0\n"
-        "# No soft/hard lockup watchdog timers.\n"
-        "kernel.watchdog = 0\n"
-        "kernel.nmi_watchdog = 0\n"
-        "# Update VM stats every 10s instead of every 1s.\n"
-        "vm.stat_interval = 10\n"
+        "# Written by tperf/host/prepare.py\n" + "".join(f"# {why}\n{k} = {v}\n" for k, (v, why, _) in SYSCTLS.items())
     )
     if run("sysctl", "-q", "-e", "-p", str(SYSCTL_FILE), check=False, stderr=DEVNULL):
         return
@@ -526,6 +590,22 @@ def apply_gpu() -> tuple[str, str] | None:
     log(f"Locking GPU SM clocks to {clk} MHz on all GPUs")
     if not run("nvidia-smi", "-lgc", f"{clk},{clk}", check=False, stdout=DEVNULL):
         warn("nvidia-smi -lgc failed")
+    else:
+        # Requested is not effective: a lock above what the power budget allows is overridden by the power cap.
+        # A GPU just put in persistence mode takes a moment to leave its idle clock: poll before judging.
+        off: dict[str, str] = {}
+        for _ in range(10):
+            now = output("nvidia-smi", "--query-gpu=index,clocks.sm", "--format=csv,noheader,nounits", fallback="")
+            off = {}
+            for line in lines(now):
+                idx, _, mhz = (x.strip() for x in line.partition(","))
+                if mhz.isdigit() and abs(int(mhz) - int(clk)) > 15:
+                    off[idx] = mhz
+            if not off:
+                break
+            time.sleep(0.5)
+        for idx, mhz in off.items():
+            warn(f"GPU {idx} runs at {mhz} MHz 5 s after locking to {clk} MHz")
     # Memory clock: lock to the max so it never drops to idle clocks between iterations.
     memclk = max_clock("memory")
     log(f"Locking GPU memory clocks to {memclk} MHz on all GPUs")
@@ -534,23 +614,22 @@ def apply_gpu() -> tuple[str, str] | None:
     return clk, memclk
 
 
-def apply_irqs() -> list[str]:
-    """Route device interrupts to housekeeping CPUs (the first CPU of each NUMA node), away from the cores
-    benchmarks are pinned to (tperf runs skip each node's first core). Each GPU's interrupts go to the
-    housekeeping CPU of its own node. irqbalance is masked, so this stays put. Returns the housekeeping CPUs."""
-    cpus = subprocess.run(["lscpu", "-p=CPU,NODE"], stdout=subprocess.PIPE, text=True, check=True).stdout
-    hk: dict[str, str] = {}  # NUMA node -> its first CPU, in lscpu order
-    for line in lines(cpus):
-        if not line.startswith("#"):
-            cpu, node = line.split(",")[:2]
-            hk.setdefault(node, cpu)
+def apply_irqs() -> dict[str, str]:
+    """Route device interrupts to the housekeeping CPUs (every thread of the first core of each NUMA node), away from
+    the cores benchmarks are pinned to (tperf runs skip each node's first core). Each GPU's interrupts go to the
+    housekeeping CPUs of its own node. irqbalance is masked, so this stays put. Returns node -> housekeeping CPUs."""
+    topo = subprocess.run(["lscpu", "-p=CPU,CORE,NODE"], stdout=subprocess.PIPE, text=True, check=True).stdout
+    hk_cpus = housekeeping(topo)
+    hk = {node: cpu_ranges(cpus) for node, cpus in hk_cpus.items()}
     log(f"Routing device interrupts to housekeeping CPUs: {' '.join(hk.values())} (GPU -> node map: {GPU_NUMA_MAP})")
-    irq_affinity(list(hk.values()), GPU_NUMA_MAP.split())
-    report_unmoved_irqs(set(hk.values()))
+    irq_affinity(hk, GPU_NUMA_MAP.split())
+    hk_set = set().union(*hk_cpus.values())
+    report_unmoved_irqs(hk_set)
     if ISOLATE_MANAGED_IRQS:
-        all_cpus = [line.split(",")[0] for line in lines(cpus) if not line.startswith("#")]
-        apply_isolcpus([int(c) for c in all_cpus if c not in hk.values()])
-    return list(hk.values())
+        apply_isolcpus(sorted(all_cpus(topo) - hk_set))
+    else:
+        remove_isolcpus()
+    return hk
 
 
 def cpu_ranges(cpus: list[int]) -> str:
@@ -575,49 +654,78 @@ def apply_isolcpus(bench_cpus: list[int]) -> None:
     if read(str(GRUB_FILE), "") + "\n" != want:
         GRUB_FILE.parent.mkdir(parents=True, exist_ok=True)
         GRUB_FILE.write_text(want)
-        if not run("update-grub", check=False, quiet=True):
-            warn(f"update-grub failed: {arg} will not be on the next boot")
-            return
         note(f"wrote {GRUB_FILE}")
+    # Checked on every apply, so a failed update-grub is retried until the boot config has the argument
+    if arg not in read(str(GRUB_CFG), ""):
+        if not run("update-grub", check=False, quiet=True) or arg not in read(str(GRUB_CFG), ""):
+            warn(f"update-grub did not put {arg} in {GRUB_CFG}: retried by the next apply")
+            return
+        note(f"{GRUB_CFG} updated")
     if arg in read("/proc/cmdline").split():
         note("active on the running kernel")
     else:
         warn(f"reboot required for {arg} to take effect")
 
 
-def report_unmoved_irqs(hk: set[str]) -> None:
-    """Report device interrupts left on the benchmark CPUs. Two cases, told apart by requested vs effective affinity:
-    refused, when the kernel manages the interrupt (one per queue per CPU, e.g. NVMe queues: the write fails with
-    EIO and irq_affinity ignores it); pending, when the new affinity was accepted but x86 only moves an interrupt at
-    its next delivery."""
-    names = {}
+def remove_isolcpus() -> None:
+    """ISOLATE_MANAGED_IRQS=0: take out what a previous apply added."""
+    if not GRUB_FILE.is_file():
+        return
+    log(f"Removing {GRUB_FILE} (ISOLATE_MANAGED_IRQS=0)")
+    GRUB_FILE.unlink()
+    if not run("update-grub", check=False, quiet=True):
+        warn("update-grub failed: the old isolcpus argument is still in the boot config")
+    elif "isolcpus=managed_irq" in read("/proc/cmdline"):
+        warn("reboot required to drop isolcpus=managed_irq from the running kernel")
+
+
+def classify_irqs(irqs: list[tuple[str, str, str]], hk: set[int], ncpus: int) -> tuple[dict[str, int], list[str]]:
+    """(name, requested affinity, effective affinity) per interrupt -> ({name: count} refused, [names] pending).
+
+    Refused: the kernel manages the interrupt (one per queue per CPU, e.g. NVMe queues: writing its affinity fails
+    with EIO) and it runs on a benchmark CPU; isolcpus=managed_irq moves it only when its mask holds a housekeeping CPU.
+    Pending: the new affinity was accepted, but x86 moves an interrupt only at its next delivery. An interrupt still
+    requested on every CPU is not a device interrupt we route."""
+    everything = set(range(ncpus))
+    refused: dict[str, int] = {}
+    pending: list[str] = []
+    for name, requested, effective in irqs:
+        req, eff = parse_cpulist(requested), parse_cpulist(effective)
+        if not req or req >= everything:
+            continue
+        if req <= hk:
+            if eff and not eff <= hk:
+                pending.append(name)
+        elif not (eff and eff <= hk):
+            refused[name] = refused.get(name, 0) + 1
+    return refused, pending
+
+
+def report_unmoved_irqs(hk: set[int]) -> None:
+    """Report device interrupts left on the benchmark CPUs (see classify_irqs)."""
+    irqs = []
     for line in lines(read("/proc/interrupts")):
         irq, _, rest = line.partition(":")
-        if irq.strip().isdigit() and rest.split():
-            names[irq.strip()] = rest.split()[-1]
-    refused: dict[str, list[str]] = {}
-    pending: list[str] = []
-    for irq, name in names.items():
-        requested = read(f"/proc/irq/{irq}/smp_affinity_list", "")
-        effective = read(f"/proc/irq/{irq}/effective_affinity_list", "")
-        if requested not in hk and requested != f"0-{os.cpu_count() - 1}":  # all CPUs: not a device IRQ we route
-            # Managed: the kernel picks the CPU. isolcpus=managed_irq makes it a housekeeping CPU when the mask has one
-            if effective not in hk:
-                refused.setdefault(name, []).append(requested)
-        elif effective and effective not in hk and requested in hk:
-            pending.append(name)
+        irq = irq.strip()
+        if irq.isdigit() and rest.split():
+            irqs.append((
+                rest.split()[-1],
+                read(f"/proc/irq/{irq}/smp_affinity_list", ""),
+                read(f"/proc/irq/{irq}/effective_affinity_list", ""),
+            ))  # fmt: skip
+    refused, pending = classify_irqs(irqs, hk, os.cpu_count() or 1)
     if pending:
         note(f"{len(pending)} interrupts move at their next delivery: {' '.join(sorted(set(pending)))}")
     if refused:
-        detail = " ".join(sorted(refused))
         warn(
-            f"{sum(map(len, refused.values()))} kernel-managed interrupts stay on the benchmark CPUs: their queue is"
+            f"{sum(refused.values())} kernel-managed interrupts stay on the benchmark CPUs: their queue is"
             f" bound to benchmark CPUs only, so they fire on that CPU's own I/O (model loading), not the timed loop."
-            f" isolcpus=managed_irq cannot move them; fewer queues would need a kernel with isolcpus io_queue: {detail}"
+            f" isolcpus=managed_irq cannot move them; fewer queues would need a kernel with isolcpus io_queue:"
+            f" {' '.join(sorted(refused))}"
         )
 
 
-def apply_boot_unit(hk: list[str], clocks: tuple[str, str] | None) -> None:
+def apply_boot_unit(hk: dict[str, str], clocks: tuple[str, str] | None) -> None:
     """Runtime-only settings (THP, KSM, C-states, GPU clock lock) are lost on reboot.
     Install a oneshot unit that re-applies them at boot, so a rebooted box is never half-tuned."""
     log(f"Installing {BOOT_UNIT} (re-applies runtime settings at boot)")
@@ -668,6 +776,7 @@ def revert() -> None:
     if shutil.which("snap"):
         run("snap", "refresh", "--unhold", check=False, quiet=True)
 
+    orig = json.loads(read(str(ORIG_STATE), '{"complete": false}'))
     log("Removing sysctl and apt overrides")
     SYSCTL_FILE.unlink(missing_ok=True)
     if GRUB_FILE.is_file():
@@ -676,6 +785,9 @@ def revert() -> None:
         log(f"Removed {GRUB_FILE}: the kernel command line is back to the default at the next reboot")
     APT_FILE.unlink(missing_ok=True)
     run("sysctl", "-q", "--system", check=False, quiet=True)
+    originals = orig.get("sysctl") or {k: default for k, (_, _, default) in SYSCTLS.items()}
+    for k, v in originals.items():
+        run("sysctl", "-q", "-w", f"{k}={v}", check=False, quiet=True)  # nmi_watchdog may refuse, as on apply
 
     log("Restoring runtime settings")
     if RUNTIME_STATE.is_file():
@@ -687,16 +799,28 @@ def revert() -> None:
                 write(f"{THP}/defrag", v)
             elif k == "ksm_run" and os.access(KSM_RUN, os.W_OK):
                 write(KSM_RUN, v)
+    saved_idle = orig.get("cpuidle", {})
     for st in glob.glob("/sys/devices/system/cpu/cpu*/cpuidle/state*/disable"):
-        write(st, 0)
+        write(st, saved_idle.get(st, 0), check=False)
+    if orig.get("irq"):
+        log("Restoring interrupt affinities")
+        for path, cpus in orig["irq"].items():
+            if cpus:
+                write(path, cpus, check=False)  # managed interrupts refuse: they were never moved
     if shutil.which("nvidia-smi"):
         run("nvidia-smi", "-rgc", check=False, quiet=True)
         run("nvidia-smi", "-rmc", check=False, quiet=True)
+        if orig.get("gpu_persistence") and all(m == "Disabled" for m in orig["gpu_persistence"]):
+            run("nvidia-smi", "-pm", "0", check=False, quiet=True)
     run("systemctl", "disable", BOOT_UNIT, check=False, quiet=True)
     for f in (Path(f"/etc/systemd/system/{BOOT_UNIT}"), BOOT_SCRIPT, OLD_BOOT_SCRIPT, PERSISTENCED_DROPIN):
         f.unlink(missing_ok=True)
     run("systemctl", "daemon-reload")
-    # The NVIDIA driver and the package holds are left in place on purpose.
+    run("systemctl", "try-restart", "nvidia-persistenced.service", check=False, quiet=True)  # drop-in gone
+    if not orig.get("complete"):
+        log("No original values were recorded (host tuned before they were): sysctls, idle states and IRQs are back"
+            " to kernel defaults, not necessarily to what they were")  # fmt: skip
+    # Provisioning, not tuning, stays on purpose: the NVIDIA driver, the package holds, the formatted cache disk.
 
     shutil.rmtree(STATE_DIR)
     log("Reverted")
@@ -775,13 +899,17 @@ def main(argv: list[str] | None = None) -> None:
         return status()
     if os.geteuid() != 0:
         sys.exit("must run as root (use sudo)")
+    lock = open(LOCK_FILE, "w")  # noqa: SIM115 (held until the process exits)
+    fcntl.flock(lock, fcntl.LOCK_EX)  # waits for a concurrent apply/revert (e.g. two runs re-tuning) to finish
     if action == "revert":
         try:
             return revert()
         except subprocess.CalledProcessError as e:
             sys.exit(f"command failed (exit {e.returncode}): {shlex.join(map(str, e.cmd))}")
     try:
+        first_apply = not UNIT_STATE.is_file()
         save_unit_state()
+        save_orig_state(first_apply)
         reboot_required = install_gpu_driver()  # before masking units: needs apt
         apply_storage()
         apply_units()
