@@ -430,13 +430,22 @@ def area_chart(xs: list[float], layers: list[tuple[str, list[float], str]], line
         pts = " ".join(f"{sx(x):.1f},{sy(v):.1f}" for x, v in zip(xs, values))
         out.append(f'<polyline points="{pts}" style="stroke:{color}" class="line"><title>{esc(name)}</title>'
                    "</polyline>")  # fmt: skip
-    for x, label in marks:
+    taken: list[tuple[float, float, int]] = []  # (left, right, row) of the labels placed so far
+    for x, label in sorted(marks):
         if x0 <= x <= x1:
             out.append(f'<line x1="{sx(x):.1f}" x2="{sx(x):.1f}" y1="{mt}" y2="{mt + ph}" class="mark"/>')
-            right = sx(x) > w - mr - 110  # a label near the right edge goes on the left of its line
+            width = 6.5 * len(label) + 4  # 11px text, roughly
+            right = sx(x) > w - mr - width  # a label near the right edge goes on the left of its line
+            left_px = sx(x) - width if right else sx(x)
+            # Labels of phases close together go on the next row down instead of on top of each other
+            row = 0
+            while any(r == row and left_px < b and a < left_px + width for a, b, r in taken):
+                row += 1
+            taken.append((left_px, left_px + width, row))
             tx, anchor = (sx(x) - 4, "end") if right else (sx(x) + 4, "start")
             out.append(
-                f'<text x="{tx:.1f}" y="{mt + 10}" class="mark-label" text-anchor="{anchor}">{esc(label)}</text>'
+                f'<text x="{tx:.1f}" y="{mt + 10 + 13 * row}" class="mark-label" text-anchor="{anchor}">'
+                f"{esc(label)}</text>"
             )
     if peak is not None and peak[0] is not None:
         px, py = sx(peak[0]), sy(peak[1])
