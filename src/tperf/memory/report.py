@@ -49,6 +49,34 @@ def _frames(entry: dict) -> list[dict]:
     return entry.get("frames") or []
 
 
+# Frames of the benchmark tool itself (runner, phase markers): not what a reader is looking for, so stacks and
+# allocation sites skip them
+HIDDEN_PATHS = ("/tperf/",)
+
+
+def visible(frames: list[dict]) -> list[dict]:
+    return [f for f in frames if not any(h in f.get("filename", "") for h in HIDDEN_PATHS)]
+
+
+def visible_host(frames: list[tuple]) -> list[tuple]:
+    return [f for f in frames if not any(h in f[1] for h in HIDDEN_PATHS)]
+
+
+def strip_hidden_frames(snapshot: dict) -> dict:
+    """The snapshot without benchmark-tool frames (in place), for publishing."""
+    for seg in snapshot.get("segments", []):
+        if "frames" in seg:
+            seg["frames"] = visible(seg["frames"])
+        for block in seg.get("blocks", []):
+            if "frames" in block:
+                block["frames"] = visible(block["frames"])
+    for trace in snapshot.get("device_traces", []):
+        for ev in trace:
+            if "frames" in ev:
+                ev["frames"] = visible(ev["frames"])
+    return snapshot
+
+
 def short_path(filename: str) -> str:
     for anchor in ("/transformers/", "/tperf/", "/torch/", "/site-packages/"):
         if anchor in filename:
@@ -86,6 +114,9 @@ def gpu_site(frames: list[dict]) -> str:
     outside torch, else the innermost frame."""
     if not frames:
         return "(allocated before recording started)"
+    frames = visible(frames)
+    if not frames:
+        return "(benchmark harness)"
     for f in frames:
         if "/transformers/" in f.get("filename", ""):
             return frame_label(f)
@@ -239,7 +270,7 @@ def analyze_gpu(snapshot: dict, marker_function: str, marker_unit: int, device: 
         s["bytes"] += size
         s["count"] += 1
         if size > s["largest"]:
-            s["largest"], s["stack"] = size, [frame_label(f) for f in frames[:25]]
+            s["largest"], s["stack"] = size, [frame_label(f) for f in visible(frames)[:25]]
     return {
         "events": len(events),
         # Frees of allocations the trace never saw: the ring buffer wrapped, and the start of the run is missing
@@ -268,6 +299,7 @@ def gpu_summary(snapshot: dict, marker_function: str, marker_unit: int) -> dict:
 
 def host_site(frames: list[tuple]) -> str:
     """memray frames are (function, file, line), innermost first."""
+    frames = visible_host(frames)
     for fn, file, line in frames:
         if "/transformers/" in file:
             return f"{short_path(file)}:{line} {fn}"
@@ -330,7 +362,10 @@ def analyze_host(path: Path) -> dict:
         s["count"] += rec.n_allocations
         s["allocators"].add(allocator)
         if rec.size > s["largest"]:
-            s["largest"], s["stack"] = rec.size, [f"{short_path(f)}:{ln} {fn}" for fn, f, ln in frames[:25]]
+            s["largest"], s["stack"] = (
+                rec.size,
+                [f"{short_path(f)}:{ln} {fn}" for fn, f, ln in visible_host(frames)[:25]],
+            )
     for s in sites.values():
         s["allocators"] = sorted(s["allocators"])
     ordered = sorted(sites.values(), key=lambda s: -s["bytes"])
@@ -545,7 +580,8 @@ def tile(label: str, value: str, sub: str = "") -> str:
     )
 
 
-CSS = """
+# Colours as tokens: standalone pages define them (light and dark); a host page maps them onto its own (SITE_TOKENS)
+TOKENS = """
 :root{--bg:#fbfbfa;--panel:#fff;--text:#1d1d1f;--muted:#6b6b70;--line:#e4e4e7;--grid:#ececef;--accent:#3b6fd8;
 --c1:#3b6fd8;--c2:#d9822b;--c3:#8a5cd1;--c4:#2a9d8f;--c5:#9a9aa1;--peak:#d1495b;--code:#f3f3f5}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#141416;--panel:#1c1c1f;--text:#ececef;
@@ -555,46 +591,67 @@ CSS = """
 --accent:#6e9bf0;--c1:#6e9bf0;--c2:#f0a35e;--c3:#b08ef0;--c4:#4fc3b4;--c5:#77777f;--peak:#f0717f;--code:#232327}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);
 font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
-main{max-width:1100px;margin:0 auto;padding:28px 16px 64px}h1{font-size:22px;margin:0 0 4px}
-h2{font-size:17px;margin:36px 0 10px}h3{font-size:14px;margin:20px 0 8px;color:var(--muted);font-weight:600}
-.muted,.note{color:var(--muted)}.note{font-size:12.5px}code,pre{font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
-pre{background:var(--code);padding:10px;border-radius:6px;overflow-x:auto;margin:6px 0}
-.meta{color:var(--muted);font-size:13px}.meta code{color:var(--text)}
-.error{border:1px solid var(--peak);color:var(--peak);padding:8px 12px;border-radius:6px;margin:12px 0}
-.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;margin-top:18px}
-.tile{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
-.tile-label{font-size:12px;color:var(--muted)}.tile-value{font-size:20px;font-weight:600;margin-top:2px}
-.tile-sub{font-size:12px;color:var(--muted)}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px}
-.chart{width:100%;height:auto;display:block}.grid{stroke:var(--grid)}.tick{fill:var(--muted);font-size:11px}
-.area{opacity:.85}.line{fill:none;stroke-width:1.5;stroke-dasharray:4 3}.mark{stroke:var(--muted);stroke-dasharray:2 3}
-.mark-label{fill:var(--muted);font-size:11px}.peak{fill:var(--peak)}
-.legend{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12.5px;margin:4px 0 8px}
-.legend i{display:inline-block;width:11px;height:11px;border-radius:2px;margin-right:6px;vertical-align:-1px}
-.legend i.dash{height:0;border-top:2px dashed;background:none!important;width:14px;vertical-align:3px}
-.bar-row{display:grid;grid-template-columns:minmax(120px,260px) 1fr 130px;gap:10px;align-items:center;margin:4px 0;
-font-size:13px}.bar-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.bar-track{background:var(--grid);border-radius:3px;height:10px;overflow:hidden}.bar-fill{display:block;height:100%}
-.bar-val{text-align:right;font-variant-numeric:tabular-nums}.bar-val small{color:var(--muted)}
-.cols{display:grid;grid-template-columns:1fr 1fr;gap:14px}@media (max-width:760px){.cols{grid-template-columns:1fr}
-.bar-row{grid-template-columns:110px 1fr 100px}}
-.table-wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px}
-th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
-th{color:var(--muted);font-weight:600;font-size:12px}.num{text-align:right;font-variant-numeric:tabular-nums;
-white-space:nowrap}summary{cursor:pointer}summary code{white-space:normal;word-break:break-all}
-a{color:var(--accent)}
+.mem{max-width:1100px;margin:0 auto;padding:28px 16px 64px}
+"""
+# Inside a page that has --bg, --panel, --fg, --muted, --line, --accent, --hover and --bad (the Transformers CI
+# dashboard): mid-tone series colours that read on light and dark
+SITE_TOKENS = """
+.mem{--text:var(--fg);--grid:var(--line);--code:var(--hover);--peak:var(--bad);
+--c1:#5b8def;--c2:#e8964a;--c3:#a07ae6;--c4:#3fb3a4;--c5:#8d8d96}
+"""
+RULES = """
+.mem h1{font-size:22px;margin:0 0 4px}.mem h2{font-size:17px;margin:36px 0 10px}
+.mem h3{font-size:14px;margin:20px 0 8px;color:var(--muted);font-weight:600}
+.mem .muted,.mem .note{color:var(--muted)}.mem .note{font-size:12.5px}
+.mem code,.mem pre{font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
+.mem pre{background:var(--code);padding:10px;border-radius:6px;overflow-x:auto;margin:6px 0}
+.mem .meta{color:var(--muted);font-size:13px}.mem .meta code{color:var(--text)}
+.mem .error{border:1px solid var(--peak);color:var(--peak);padding:8px 12px;border-radius:6px;margin:12px 0}
+.mem .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;margin-top:18px}
+.mem .tile{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+.mem .tile-label{font-size:12px;color:var(--muted)}.mem .tile-value{font-size:20px;font-weight:600;margin-top:2px}
+.mem .tile-sub{font-size:12px;color:var(--muted)}
+.mem .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px}
+.mem .chart{width:100%;height:auto;display:block}.mem .grid{stroke:var(--grid)}
+.mem .tick{fill:var(--muted);font-size:11px}.mem .area{opacity:.85}
+.mem .line{fill:none;stroke-width:1.5;stroke-dasharray:4 3}.mem .mark{stroke:var(--muted);stroke-dasharray:2 3}
+.mem .mark-label{fill:var(--muted);font-size:11px}.mem .peak{fill:var(--peak)}
+.mem .legend{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12.5px;margin:4px 0 8px}
+.mem .legend i{display:inline-block;width:11px;height:11px;border-radius:2px;margin-right:6px;vertical-align:-1px}
+.mem .legend i.dash{height:0;border-top:2px dashed;background:none!important;width:14px;vertical-align:3px}
+.mem .bar-row{display:grid;grid-template-columns:minmax(120px,260px) 1fr 130px;gap:10px;align-items:center;
+margin:4px 0;font-size:13px}.mem .bar-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mem .bar-track{background:var(--grid);border-radius:3px;height:10px;overflow:hidden}
+.mem .bar-fill{display:block;height:100%}.mem .bar-val{text-align:right;font-variant-numeric:tabular-nums}
+.mem .bar-val small{color:var(--muted)}.mem .cols{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media (max-width:760px){.mem .cols{grid-template-columns:1fr}.mem .bar-row{grid-template-columns:110px 1fr 100px}}
+.mem .table-wrap{overflow-x:auto}.mem table{border-collapse:collapse;width:100%;font-size:13px}
+.mem th,.mem td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top;
+white-space:normal}.mem th{color:var(--muted);font-weight:600;font-size:12px}
+.mem .num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.mem summary{cursor:pointer}
+.mem summary code{white-space:normal;word-break:break-all}.mem a{color:var(--accent)}
+.mem .explore{display:flex;flex-wrap:wrap;gap:10px;margin:12px 0}
+.mem .explore a{border:1px solid var(--line);border-radius:6px;padding:8px 12px;text-decoration:none;
+background:var(--panel)}.mem .explore small{display:block;color:var(--muted);font-size:12px}
 """
 
 
-def render(profile: dict, gpu: dict | None, host: dict | None, files: dict[str, str]) -> str:
+def title_of(profile: dict) -> str:
+    return f"Memory profile: {profile.get('model_id', '?')}"
+
+
+def render_body(profile: dict, gpu: dict | None, host: dict | None, links: dict) -> str:
+    """The report's content, inside <div class="mem">: every value from the data is escaped, and there is no script.
+
+    links: "flamegraph" and "memory_viz" (URLs, or absent), "files" ([(name, what)] listed at the end)."""
     cfg = profile.get("config") or {}
     marks = profile.get("marks") or []
     weights = profile.get("weights") or {}
     load = profile.get("load_memory") or {}
     names = [m["name"] for m in marks]
     v = profile.get("versions") or {}
-    title = f"Memory profile: {profile.get('model_id', '?')}"
-    parts = [f"<main><h1>{esc(title)}</h1>"]
+    title = title_of(profile)
+    parts = [f"<div class='mem'><h1>{esc(title)}</h1>"]
     scenario = (f"batch {cfg.get('batch_size')} · prompt {cfg.get('sequence_length')} tokens · "
                 f"{cfg.get('num_tokens_to_generate')} new tokens · {cfg.get('attn_implementation')}"
                 + (f" · compile {cfg['compile_kwargs'].get('mode')}" if cfg.get("compile_kwargs") else "")
@@ -621,6 +678,20 @@ def render(profile: dict, gpu: dict | None, host: dict | None, files: dict[str, 
              f"{fmt_mb(load.get('load_disk_read_mb'))} from disk"),
     ]  # fmt: skip
     parts.append(f"<div class='tiles'>{''.join(tiles)}</div>")
+
+    explore = []
+    if links.get("memory_viz"):
+        explore.append(
+            f"<a href='{esc(links['memory_viz'])}' target='_blank' rel='noopener'>Every GPU allocation ↗"
+            "<small>PyTorch's memory viewer, this run's allocator trace loaded</small></a>"
+        )
+    if links.get("flamegraph"):
+        explore.append(
+            f"<a href='{esc(links['flamegraph'])}' target='_blank' rel='noopener'>Host memory flamegraph ↗"
+            "<small>memray, at the host peak</small></a>"
+        )
+    if explore:
+        parts.append(f"<div class='explore'>{''.join(explore)}</div>")
 
     parts.append("<h2>Phases</h2>" + phase_table(marks))
 
@@ -695,7 +766,7 @@ def render(profile: dict, gpu: dict | None, host: dict | None, files: dict[str, 
             + "<p class='note'>RSS includes file pages mapped from safetensors files; memray's heap counts what was "
             "allocated, including whole mmap'd files, whether their pages were read or not.</p></div>"
         )  # fmt: skip
-        flame = files.get("flamegraph")
+        flame = links.get("flamegraph")
         parts.append(
             "<h3>At the peak</h3><div class='cols'><div class='card'>"
             + tile("memray peak", fmt_bytes(host["peak_bytes"]), f"{host['total_allocations']:,} allocations")
@@ -704,7 +775,7 @@ def render(profile: dict, gpu: dict | None, host: dict | None, files: dict[str, 
             + bars(host["by_allocator"], host["peak_bytes"])
             + "<p class='note'><code>mmap</code> is mostly mapped files (safetensors): address space, resident only "
             "where read.</p></div></div>"
-            + (f"<p>Full flamegraph: <a href='{esc(flame)}'>{esc(flame)}</a>"
+            + (f"<p>Full flamegraph: <a href='{esc(flame)}' target='_blank' rel='noopener'>memray flamegraph</a>"
                f"{' (native frames included)' if host['native'] else ''}.</p>" if flame else "")
             + "<h3>Heap at the peak (malloc and friends), by the code that allocated it</h3>"
             + sites_table(host["heap_sites"], host["peak_bytes"], show_allocators=True)
@@ -712,52 +783,81 @@ def render(profile: dict, gpu: dict | None, host: dict | None, files: dict[str, 
             + sites_table(host["mmap_sites"], host["peak_bytes"], show_allocators=True)
         )  # fmt: skip
 
-    parts.append(
-        "<h2>Files</h2><ul>"
-        + "".join(f"<li><code>{esc(name)}</code>: {esc(what)}</li>" for name, what in files.get("_list", []))
-        + "</ul><p class='note'>Open <code>gpu_snapshot.pickle</code> in <a href='https://pytorch.org/memory_viz'>"
-        "pytorch.org/memory_viz</a> (it stays in the browser) for every allocation on the timeline; "
-        "<code>memray flamegraph --temporal</code> needs a run with <code>--memray-all</code>.</p></main>"
-    )
+    if links.get("files"):
+        parts.append(
+            "<h2>Files</h2><ul>"
+            + "".join(f"<li><code>{esc(name)}</code>: {esc(what)}</li>" for name, what in links["files"])
+            + "</ul><p class='note'>To browse every GPU allocation, gunzip <code>gpu_snapshot.pickle.gz</code> and "
+            "open it in <a href='https://pytorch.org/memory_viz'>pytorch.org/memory_viz</a> (it stays in the "
+            "browser).</p>"
+        )
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def render(profile: dict, gpu: dict | None, host: dict | None, links: dict) -> str:
+    """A standalone page."""
     return (
         f"<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' "
-        f"content='width=device-width,initial-scale=1'><title>{esc(title)}</title><style>{CSS}</style></head>"
-        f"<body>{''.join(parts)}</body></html>"
+        f"content='width=device-width,initial-scale=1'><title>{esc(title_of(profile))}</title>"
+        f"<style>{TOKENS}{RULES}</style></head><body>{render_body(profile, gpu, host, links)}</body></html>"
     )
+
+
+def render_fragment(profile: dict, gpu: dict | None, host: dict | None, links: dict) -> dict:
+    """For a host page with its own header and styles (the Transformers CI dashboard): {title, css, body}. The body
+    has no script and escapes every value, so the host page can inline it."""
+    return {"title": title_of(profile), "css": SITE_TOKENS + RULES, "body": render_body(profile, gpu, host, links)}
+
+
+def load_summaries(profile_dir: Path) -> tuple[dict, dict | None, dict | None]:
+    """profile.json, gpu_summary.json and host_summary.json of a profile directory (the last two may be absent)."""
+
+    def read(name: str):
+        path = Path(profile_dir) / name
+        return json.loads(path.read_text()) if path.exists() else None
+
+    return read("profile.json"), read("gpu_summary.json"), read("host_summary.json")
 
 
 def build(profile_dir: Path) -> Path:
+    """report.html from a profile directory; also writes host_summary.json (from host.memray.bin), so the report can
+    be rendered again without memray (tperf.memory.report.render_fragment, from the published summaries)."""
     profile_dir = Path(profile_dir)
     profile = json.loads((profile_dir / "profile.json").read_text())
-    files: dict = {"_list": [("profile.json", "phase counters and the model's tensors")]}
+    files = [("profile.json", "phase counters and the model's tensors")]
+    links: dict = {"files": files}
     gpu = None
     snap_path = profile_dir / "gpu_snapshot.pickle"
     summary_path = profile_dir / "gpu_summary.json"
     if summary_path.exists():
         gpu = json.loads(summary_path.read_text())
-        files["_list"].append(("gpu_summary.json", "the GPU trace, replayed: timeline and live set at the peak"))
-        if snap_path.exists():
-            files["_list"].append(("gpu_snapshot.pickle", "the CUDA allocator's history, for pytorch.org/memory_viz"))
+        files.append(("gpu_summary.json", "the GPU trace, replayed: timeline and live set at the peak"))
     elif snap_path.exists():
         with open(snap_path, "rb") as f:
             snapshot = pickle.load(f)
         gpu = analyze_gpu(snapshot, profile.get("marker_function", "_tperf_phase_marker"),
                           profile.get("marker_unit", 1 << 20))  # fmt: skip
-        files["_list"].append(("gpu_snapshot.pickle", "the CUDA allocator's history, for pytorch.org/memory_viz"))
+    if (profile_dir / "gpu_snapshot.pickle.gz").exists():
+        files.append(("gpu_snapshot.pickle.gz", "the CUDA allocator's history, for pytorch.org/memory_viz"))
     host = None
     host_bin = profile_dir / "host.memray.bin"
+    host_summary = profile_dir / "host_summary.json"
     if host_bin.exists():
         try:
             host = analyze_host(host_bin)
-            files["_list"].append(("host.memray.bin", "memray capture (memray flamegraph / summary / tree)"))
+            host_summary.write_text(json.dumps(host, separators=(",", ":")))
+            files.append(("host.memray.bin", "memray capture (memray flamegraph / summary / tree)"))
             flame = profile_dir / "host-flamegraph.html"
             if memray_flamegraph(host_bin, flame):
-                files["flamegraph"] = flame.name
-                files["_list"].append((flame.name, "memray flamegraph of the host memory at its peak"))
+                links["flamegraph"] = flame.name
+                files.append((flame.name, "memray flamegraph of the host memory at its peak"))
         except ImportError:
-            print("memray is not installed: host section skipped", file=sys.stderr)
+            print("memray is not installed: host section from host_summary.json, if any", file=sys.stderr)
+    if host is None and host_summary.exists():
+        host = json.loads(host_summary.read_text())
     out = profile_dir / "report.html"
-    out.write_text(render(profile, gpu, host, files))
+    out.write_text(render(profile, gpu, host, links))
     return out
 
 

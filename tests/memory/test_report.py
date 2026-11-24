@@ -145,3 +145,32 @@ def test_timeline_spans_the_whole_trace_with_empty_bins_carried_forward():
     assert len(gpu["x"]) == MAX_POINTS and gpu["x"][0] == 0 and gpu["x"][-1] > 9.9
     assert gpu["allocated"][MAX_POINTS // 2] == 10 * MB  # no event there: the state after the first one
     assert gpu["allocated"][-1] == 15 * MB
+
+
+def test_benchmark_tool_frames_are_hidden():
+    from tperf.memory.report import host_site, strip_hidden_frames
+
+    runner = frame("/opt/bench/src/tperf/harness/framework/benchmark_runner.py", 252, "setup_benchmark")
+    to = frame("/venv/torch/_tensor.py", 9, "to")
+    assert gpu_site([to, runner]) == "torch/_tensor.py:9 to"
+    assert gpu_site([runner]) == "(benchmark harness)"
+    assert gpu_site([*ACT, runner]) == "transformers/models/llama/modeling_llama.py:210 forward"
+    host = [
+        ("synchronize", "/venv/torch/cuda/__init__.py", 1),
+        ("mark", "/opt/bench/src/tperf/memory/profile.py", 151),
+    ]
+    assert host_site(host) == "torch/cuda/__init__.py:1 synchronize"
+    snap = snapshot([ev("alloc", 1, 1, [to, runner])], [(0x1000, 8, [runner, to])])
+    strip_hidden_frames(snap)
+    assert snap["device_traces"][0][0]["frames"] == [to]
+    assert snap["segments"][0]["blocks"][0]["frames"] == [to]
+
+
+def test_fragment_has_no_script_and_escapes_data():
+    from tperf.memory.report import render_fragment
+
+    profile = {"model_id": "org/<script>alert(1)</script>", "marks": []}
+    frag = render_fragment(profile, None, None, {"memory_viz": "memory-viz.html", "flamegraph": "f.html"})
+    assert "<script" not in frag["body"] and "&lt;script&gt;" in frag["body"]
+    assert frag["body"].startswith("<div class='mem'>") and "memory-viz.html" in frag["body"]
+    assert ":root" not in frag["css"] and ".mem h1" in frag["css"]

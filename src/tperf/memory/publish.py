@@ -2,9 +2,9 @@
 
     python -m tperf.memory.publish <profile dir> --repo <dataset> --group <group id>
 
-Uploads report.html, host-flamegraph.html, profile.json, gpu_summary.json and host.memray.bin to
-memory/<YYYY-MM>/<group>/ (the group is the run's group_id, so the dashboard can link a daily point to its report).
-The GPU snapshot (hundreds of MB) stays on the host.
+Uploads the report, the summaries it is rendered from (profile.json, gpu_summary.json, host_summary.json), memray's
+flamegraph and capture, and the gzipped GPU snapshot (PyTorch's memory viewer) to memory/<YYYY-MM>/<group>/ (the group
+is the run's group_id, so the dashboard can link a daily point to its report).
 """
 
 import argparse
@@ -12,7 +12,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-FILES = ["report.html", "host-flamegraph.html", "profile.json", "gpu_summary.json", "host.memray.bin"]
+FILES = [
+    *("report.html", "host-flamegraph.html", "profile.json", "gpu_summary.json", "host_summary.json"),
+    *("host.memray.bin", "gpu_snapshot.pickle.gz"),
+]
 
 
 def main(argv: list[str] | None = None) -> None:
