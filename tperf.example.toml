@@ -7,6 +7,7 @@ ssh = "ubuntu@203.0.113.10"
 # hf_token_path = "/home/ubuntu/.cache/huggingface/token"
 
 [hub]
-# Where runs are published and the dashboard Space it rebuilds (defaults shown)
+# Where runs are published (default shown). The Transformers CI dashboard (/benchmarks) reads this dataset;
+# dashboard_space rebuilds the old static Space as well (off by default)
 # dataset = "hf-internal-testing/transformers-perf"
 # dashboard_space = "hf-internal-testing/transformers-perf-dashboard"

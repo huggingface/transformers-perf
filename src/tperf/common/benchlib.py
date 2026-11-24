@@ -45,7 +45,9 @@ CONFIG = _load_config()
 HOST = os.environ.get("HOST") or CONFIG.get("host", {}).get("ssh", "")  # user@address of the bench host
 # Where results are published; the public defaults are overridden in tperf.toml
 DATASET = CONFIG.get("hub", {}).get("dataset", "hf-internal-testing/transformers-perf")
-DASHBOARD_SPACE = CONFIG.get("hub", {}).get("dashboard_space", "hf-internal-testing/transformers-perf-dashboard")
+# The results are browsed in the Transformers CI dashboard (/benchmarks), which reads the dataset; the old static Space
+# is rebuilt only when one is configured
+DASHBOARD_SPACE = CONFIG.get("hub", {}).get("dashboard_space", "")
 SSH = ["ssh", "-o", "BatchMode=yes"]
 TF = "/opt/bench/transformers"  # transformers clone on the host (worktrees of the commits under test)
 PY = "/opt/bench/tbv2-venv/bin/python"  # harness environment on the host
