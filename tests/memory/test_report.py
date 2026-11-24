@@ -174,3 +174,35 @@ def test_fragment_has_no_script_and_escapes_data():
     assert "<script" not in frag["body"] and "&lt;script&gt;" in frag["body"]
     assert frag["body"].startswith("<div class='mem'>") and "memory-viz.html" in frag["body"]
     assert ":root" not in frag["css"] and ".mem h1" in frag["css"]
+
+
+def test_findings_flag_what_looks_wrong_and_list_what_passed():
+    from tperf.memory.report import findings, findings_box
+
+    healthy = {
+        "weights": {"weights_mb": 1000.0, "by_dtype_mb": {"bfloat16": 1000.0}, "by_device_mb": {"cuda": 1000.0}},
+        "load_memory": {"load_host_peak_rss_mb": 1500.0, "load_disk_read_mb": 1000.0},
+        "marks": [
+            {"name": "start", "host": {"rss_mb": 1000.0}},
+            {"name": "first generation", "host": {"rss_anon_mb": 900.0}, "device": {"allocated_mb": 1000.0}},
+            {"name": "generations", "host": {"rss_anon_mb": 910.0}, "process_gpu_mb": 1600.0,
+             "device": {"allocated_mb": 1000.0, "reserved_mb": 1100.0, "peak_reserved_mb": 1200.0}},
+        ],
+    }  # fmt: skip
+    gpu = {"peak_bytes": 1100 * MB, "peak_sites": [], "peak_by_category": {}, "truncated": False}
+    found, passed = findings(healthy, gpu, None)
+    assert found == [] and "allocator retries" in passed
+    assert "Nothing unusual" in findings_box(healthy, gpu, None)
+
+    bad = json.loads(json.dumps(healthy))
+    bad["weights"]["by_dtype_mb"] = {"bfloat16": 900.0, "float32": 100.0}
+    bad["weights"]["minor_dtype_modules_mb"] = {"float32": {"model.layers.*.mlp.router": 100.0}}
+    bad["load_memory"]["load_host_peak_rss_mb"] = 3500.0  # 2.5x the model on top of the start
+    bad["marks"][2]["device"].update(allocated_mb=1100.0, alloc_retries=3)
+    bad["marks"][2]["host"]["rss_anon_mb"] = 1200.0
+    big = {"category": "activations & temporaries", "largest": 600 * MB, "site": "x.py:1 f", "bytes": 600 * MB}
+    titles = " / ".join(t for _, t, _ in findings(bad, {**gpu, "peak_sites": [big]}, None)[0])
+    for expected in ("in float32, the rest in bfloat16", "2.5× the model", "more GPU memory held",
+                     "Host memory grew", "retried 3", "One temporary of 600"):  # fmt: skip
+        assert expected in titles, (expected, titles)
+    assert "model.layers.*.mlp.router" in findings_box(bad, gpu, None)

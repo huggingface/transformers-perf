@@ -143,6 +143,7 @@ def model_breakdown(model) -> dict:
     by_dtype: dict[str, float] = defaultdict(float)
     by_device: dict[str, float] = defaultdict(float)
     by_group: dict[str, float] = defaultdict(float)
+    by_dtype_group: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     totals = {"parameters_mb": 0.0, "buffers_mb": 0.0}
     named = [("parameters_mb", model.named_parameters(remove_duplicate=False)), ("buffers_mb", model.named_buffers())]
     for kind, tensors in named:
@@ -163,13 +164,22 @@ def model_breakdown(model) -> dict:
             by_dtype[str(tensor.dtype).removeprefix("torch.")] += size
             by_device[tensor.device.type] += size
             by_group[module_group(name)] += size
+            by_dtype_group[str(tensor.dtype).removeprefix("torch.")][module_group(name)] += size
     top = sorted(by_group.items(), key=lambda kv: -kv[1])[:25]
+    main_dtype = max(by_dtype, key=by_dtype.get) if by_dtype else None
+    # Where the other dtypes are (an fp32 norm or router in a bf16 model): the largest groups of each
+    minor = {
+        dtype: dict(sorted(groups.items(), key=lambda kv: -kv[1])[:10])
+        for dtype, groups in by_dtype_group.items()
+        if dtype != main_dtype
+    }
     return {
         **totals,
         "weights_mb": totals["parameters_mb"] + totals["buffers_mb"],
         "by_dtype_mb": dict(sorted(by_dtype.items(), key=lambda kv: -kv[1])),
         "by_device_mb": dict(by_device),
         "top_modules_mb": dict(top),
+        "minor_dtype_modules_mb": minor,
     }
 
 
