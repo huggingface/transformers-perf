@@ -47,6 +47,7 @@ from pathlib import Path
 STATE_DIR = Path("/var/lib/bench-prep")
 UNIT_STATE = STATE_DIR / "units.orig"
 RUNTIME_STATE = STATE_DIR / "runtime.orig"
+REPORT_FILE = STATE_DIR / "report.txt"  # what the last "apply" did and could not do; shown by "status"
 SYSCTL_FILE = Path("/etc/sysctl.d/99-bench.conf")
 APT_FILE = Path("/etc/apt/apt.conf.d/99-bench-no-auto")
 BOOT_UNIT = "bench-tuning.service"
@@ -172,12 +173,54 @@ write, quiet_memory, disable_deep_cstates, irq_affinity = (
 DEVNULL = subprocess.DEVNULL
 
 
+# The report of this run: one entry per log() step, holding the notes and warnings raised while it ran. A step
+# with a warning was not (fully) done: a VM may refuse a setting, a unit may not mask, a driver may need a reboot.
+STEPS: list[dict] = []
+
+
 def log(msg: str) -> None:
     print(f"\033[1;34m==>\033[0m {msg}")
+    STEPS.append({"step": msg, "notes": [], "blocked": []})
+
+
+def note(msg: str) -> None:
+    """Detail of what the current step did, for the report (not printed as it happens)."""
+    if STEPS:
+        STEPS[-1]["notes"].append(msg)
 
 
 def warn(msg: str) -> None:
+    """Something the current step could not do: printed now and listed in the report."""
     print(f"\033[1;33m!!\033[0m {msg}", file=sys.stderr)
+    if not STEPS:
+        STEPS.append({"step": "(setup)", "notes": [], "blocked": []})
+    STEPS[-1]["blocked"].append(msg)
+
+
+def report(outcome: str) -> None:
+    """Print what this run did and what it could not do, and save it for "status"."""
+    out = [f"tperf host tune apply: {outcome}"]
+    done = [s for s in STEPS if not s["blocked"]]
+    blocked = [s for s in STEPS if s["blocked"]]
+    out.append(f"Done ({len(done)}):")
+    for s in done:
+        out.append(f"  ok  {s['step']}")
+        out += [f"        {n}" for n in s["notes"]]
+    out.append(f"Not done or partly done ({len(blocked)}):")
+    for s in blocked:
+        out.append(f"  !!  {s['step']}")
+        out += [f"        {n}" for n in s["notes"]]
+        out += [f"        blocked: {b}" for b in s["blocked"]]
+    if not blocked:
+        out.append("  (none)")
+    text = "\n".join(out) + "\n"
+    print("== Report")
+    print(text, end="")
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        REPORT_FILE.write_text(text)
+    except OSError as e:
+        print(f"could not save the report to {REPORT_FILE}: {e}", file=sys.stderr)
 
 
 def run(*args: str, check: bool = True, quiet: bool = False, stdout=None, stderr=None) -> bool:
@@ -261,17 +304,27 @@ def apply_units() -> None:
     if shutil.which("snap") and run("systemctl", "is-active", "-q", "snapd.service", check=False):
         if not run("snap", "refresh", "--hold", check=False, quiet=True):
             warn("snap refresh --hold failed")
+    masked, disabled, absent = [], [], []
     for u in ALL_UNITS:
         if not unit_exists(u):
+            absent.append(u)
             continue
         run("systemctl", "stop", u, check=False, stderr=DEVNULL)
         # Snap units live in /etc/systemd/system and cannot be masked: disable them instead.
-        if not (
-            run("systemctl", "mask", u, check=False, quiet=True)
-            or run("systemctl", "disable", u, check=False, quiet=True)
-        ):
+        if run("systemctl", "mask", u, check=False, quiet=True):
+            masked.append(u)
+        elif run("systemctl", "disable", u, check=False, quiet=True):
+            disabled.append(u)
+        else:
             warn(f"could not mask or disable {u}")
+            continue
+        if run("systemctl", "is-active", "-q", u, check=False):
+            warn(f"{u} is still running after stop")
     run("systemctl", "daemon-reload")
+    note(f"masked {len(masked)}: {' '.join(masked) or '-'}")
+    if disabled:
+        note(f"disabled (cannot be masked) {len(disabled)}: {' '.join(disabled)}")
+    note(f"not installed {len(absent)}: {' '.join(absent) or '-'}")
 
 
 def apply_apt() -> None:
@@ -299,18 +352,45 @@ def apply_sysctl() -> None:
         "# Update VM stats every 10s instead of every 1s.\n"
         "vm.stat_interval = 10\n"
     )
-    run("sysctl", "-q", "-e", "-p", str(SYSCTL_FILE))
+    if run("sysctl", "-q", "-e", "-p", str(SYSCTL_FILE), check=False, stderr=DEVNULL):
+        return
+    # Some VMs refuse a key outright (kernel.nmi_watchdog: errno 524 on g5.4xlarge, which has no NMI watchdog to
+    # stop): fine when it already holds the wanted value, an error otherwise.
+    for line in SYSCTL_FILE.read_text().splitlines():
+        key, sep, want = (part.strip() for part in line.partition("="))
+        if not sep or key.startswith("#"):
+            continue
+        if run("sysctl", "-q", "-w", f"{key}={want}", check=False, stderr=DEVNULL):
+            continue
+        have = output("sysctl", "-n", key, fallback="n/a")
+        if have != want:
+            raise SystemExit(f"sysctl {key}: cannot set {want} (is {have})")
+        warn(f"sysctl {key}: the kernel refuses writes (already {want}, so no effect on noise)")
 
 
 def apply_runtime() -> None:
     log("Setting transparent huge pages to madvise, disabling KSM")
-    quiet_memory()
+    try:
+        quiet_memory()
+    except OSError as e:
+        warn(f"THP/KSM: {e}")
+    if not os.access(KSM_RUN, os.W_OK):
+        note("KSM: not available on this kernel")
     if not KEEP_CSTATES:
         log("Disabling idle states with exit latency > 10us")
-        disable_deep_cstates()
+        states = glob.glob("/sys/devices/system/cpu/cpu*/cpuidle/state*")
+        if not states:
+            warn("no cpuidle states exposed (the hypervisor owns idle): C-states cannot be controlled here")
+        try:
+            disable_deep_cstates()
+        except OSError as e:
+            warn(f"C-states: {e}")
     log("Dropping page cache")
     os.sync()
-    write("/proc/sys/vm/drop_caches", 3)
+    try:
+        write("/proc/sys/vm/drop_caches", 3)
+    except OSError as e:
+        warn(f"drop_caches: {e}")
 
 
 def apply_storage() -> None:
@@ -404,6 +484,7 @@ def apply_gpu() -> tuple[str, str] | None:
     """Persistence mode and clock locks. Returns the (SM, memory) clocks locked, if any."""
     if not nvidia_ok():
         if has_nvidia_gpu():
+            log("GPU tuning")
             warn("NVIDIA GPUs present but driver not working: skipping GPU tuning")
         return None
     log("Starting nvidia-persistenced in persistence mode (keeps GPUs initialised between runs)")
@@ -459,7 +540,37 @@ def apply_irqs() -> list[str]:
             hk.setdefault(node, cpu)
     log(f"Routing device interrupts to housekeeping CPUs: {' '.join(hk.values())} (GPU -> node map: {GPU_NUMA_MAP})")
     irq_affinity(list(hk.values()), GPU_NUMA_MAP.split())
+    report_unmoved_irqs(set(hk.values()))
     return list(hk.values())
+
+
+def report_unmoved_irqs(hk: set[str]) -> None:
+    """Report device interrupts left on the benchmark CPUs. Two cases, told apart by requested vs effective affinity:
+    refused, when the kernel manages the interrupt (one per queue per CPU, e.g. NVMe queues: the write fails with
+    EIO and irq_affinity ignores it); pending, when the new affinity was accepted but x86 only moves an interrupt at
+    its next delivery."""
+    names = {}
+    for line in lines(read("/proc/interrupts")):
+        irq, _, rest = line.partition(":")
+        if irq.strip().isdigit() and rest.split():
+            names[irq.strip()] = rest.split()[-1]
+    refused: dict[str, list[str]] = {}
+    pending: list[str] = []
+    for irq, name in names.items():
+        requested = read(f"/proc/irq/{irq}/smp_affinity_list", "")
+        effective = read(f"/proc/irq/{irq}/effective_affinity_list", "")
+        if requested not in hk and requested != f"0-{os.cpu_count() - 1}":  # all CPUs: not a device IRQ we route
+            refused.setdefault(name, []).append(requested)
+        elif effective and effective not in hk and requested in hk:
+            pending.append(name)
+    if pending:
+        note(f"{len(pending)} interrupts move at their next delivery: {' '.join(sorted(set(pending)))}")
+    if refused:
+        detail = " ".join(sorted(refused))
+        warn(
+            f"{sum(map(len, refused.values()))} kernel-managed interrupts cannot leave the benchmark CPUs (one queue "
+            f"per CPU, fire when that CPU does I/O): {detail}"
+        )
 
 
 def apply_boot_unit(hk: list[str], clocks: tuple[str, str] | None) -> None:
@@ -543,7 +654,7 @@ def revert() -> None:
     log("Reverted")
 
 
-def status() -> None:
+def status(last_report: bool = True) -> None:
     loadavg = " ".join(read("/proc/loadavg").split(" ")[:3])
     print(f"== Host:    {socket.gethostname()}  kernel {os.uname().release}  {len(os.sched_getaffinity(0))} CPUs")
     print(f"== Load:   {loadavg}")
@@ -564,6 +675,9 @@ def status() -> None:
     print(f"   {'thp.defrag':<28} {read(f'{THP}/defrag')}")
     print(f"   {'ksm.run':<28} {read(KSM_RUN, 'n/a')}")
     print(f"   {BOOT_UNIT:<28} {output('systemctl', 'is-enabled', BOOT_UNIT, fallback='missing')}")
+    if last_report and REPORT_FILE.is_file():
+        print("== Last apply:")
+        indented(REPORT_FILE.read_text())
     print("== Idle states (cpu0):")
     for st in sorted(glob.glob("/sys/devices/system/cpu/cpu0/cpuidle/state*")):
         name, latency, disabled = (read(f"{st}/{f}") for f in ("name", "latency", "disable"))
@@ -613,9 +727,12 @@ def main(argv: list[str] | None = None) -> None:
         return status()
     if os.geteuid() != 0:
         sys.exit("must run as root (use sudo)")
-    try:
-        if action == "revert":
+    if action == "revert":
+        try:
             return revert()
+        except subprocess.CalledProcessError as e:
+            sys.exit(f"command failed (exit {e.returncode}): {shlex.join(map(str, e.cmd))}")
+    try:
         save_unit_state()
         reboot_required = install_gpu_driver()  # before masking units: needs apt
         apply_storage()
@@ -624,15 +741,25 @@ def main(argv: list[str] | None = None) -> None:
         apply_sysctl()
         apply_runtime()
         if reboot_required:
+            log("GPU tuning, interrupt routing, boot unit")
             warn("nouveau is bound to the GPUs: reboot now, then run apply again to finish GPU setup")
+            report("stopped, reboot required")
             return
         clocks = apply_gpu()
         hk = apply_irqs()  # after the GPU driver has allocated its interrupts
         apply_boot_unit(hk, clocks)
-        log("Done. Current state:")
-        status()
-    except subprocess.CalledProcessError as e:
-        sys.exit(f"command failed (exit {e.returncode}): {shlex.join(map(str, e.cmd))}")
+    except (subprocess.CalledProcessError, SystemExit) as e:
+        msg = (
+            f"command failed (exit {e.returncode}): {shlex.join(map(str, e.cmd))}"
+            if isinstance(e, subprocess.CalledProcessError)
+            else str(e.code)
+        )
+        warn(msg)
+        report("FAILED, the steps after this one did not run")
+        sys.exit(1)
+    print("== Current state:")
+    status(last_report=False)
+    report("complete" if not any(s["blocked"] for s in STEPS) else "complete, with steps not done (see below)")
 
 
 if __name__ == "__main__":
