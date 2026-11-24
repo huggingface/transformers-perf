@@ -140,3 +140,49 @@ def test_summarize_and_compare():
     diff = compare(base, slower)
     assert "+50.0% !" in diff and "not the same" not in diff
     assert "not the same conversation" in compare(base, results([0.1, 0.2], {"turns": 3, "max_tokens": 64}))
+
+
+def serve_run(tmp_path, side, rnd, gpu, ttft_s, prefix_ms=0.0):
+    """A `tperf ab` side directory with SERVE: manifest.json and serve/results.json (8 requests)."""
+    d = tmp_path / f"round{rnd}-{side}"
+    (d / "serve").mkdir(parents=True)
+    manifest = {"run_id": f"ab-r{rnd}-{side}-run1", "group_id": f"ab-r{rnd}-{side}", "started_at": f"2026-11-24T1{rnd}",
+                "label": f"ab-pr1-{side}", "source": "pr", "pr_number": 1, "commit_id": side * 4, "ab_id": "ab",
+                "ab_side": side, "ab_round": rnd, "model_id": "m", "bench_args": "serve chat", "gpu_index": gpu,
+                "instance_type": "g5", "gpu_name": "A10G", "sm_clock_mhz": 1710}  # fmt: skip
+    (d / "manifest.json").write_text(json.dumps(manifest))
+    turns = [{"turn": t, "ttft_s": ttft_s + t * prefix_ms / 1e3, "e2e_s": 3.0 + ttft_s, "itl_ms": 47.0,
+              "completion_tokens": 64} for t in range(8)]  # fmt: skip
+    results = {"scenario": "chat", "error": None, "startup_s": 7.0, "turns": turns,
+               "args": {"concurrency": 1, "system_tokens": 256, "max_tokens": 64, "warmup": 1,
+                        "server_args": "--attn-implementation sdpa"}}  # fmt: skip
+    (d / "serve" / "results.json").write_text(json.dumps(results))
+    return d
+
+
+def test_serve_run_is_one_row(tmp_path):
+    from tperf.common.record import COLUMNS, scenario_rows
+
+    (row,) = scenario_rows(serve_run(tmp_path, "base", 1, 0, 0.2, prefix_ms=40))
+    assert row["scenario"] == "serve:chat" and row["success"] and row["n_samples"] == 8
+    assert row["attn_implementation"] == "sdpa" and row["batch_size"] == 1 and row["num_tokens_to_generate"] == 64
+    assert row["ttft_ms_min"] == 200 and abs(row["ttft_ms_max"] - (200 + 7 * 40)) < 1e-6
+    assert row["itl_ms_median"] == 47.0 and row["startup_load_time_s"] == 7.0
+    assert set(row) <= set(COLUMNS)  # publishable as is
+
+
+def test_serve_ab_is_analyzed_and_labelled(tmp_path):
+    from tperf.ab.compare import analyze
+    from tperf.common.record import scenario_rows
+    from tperf.dashboard.build import ab_results
+
+    rows = []
+    for rnd in range(1, 5):
+        gb, gh = (0, 4) if rnd % 2 else (4, 0)
+        rows += scenario_rows(serve_run(tmp_path, "base", rnd, gb, 0.30 + rnd * 1e-3))
+        rows += scenario_rows(serve_run(tmp_path, "head", rnd, gh, 0.14))
+    (scenario,) = analyze(rows)["scenarios"]
+    ttft = next(m for m in scenario["metrics"] if m["name"] == "ttft")
+    assert ttft["verdict"] == "improvement" and ttft["change_pct"] < -50
+    (run,) = ab_results(rows)
+    assert run["pr"] == 1 and run["scenarios"][0]["scenario"] == "transformers serve, chat · 8 requests of 64 tokens"

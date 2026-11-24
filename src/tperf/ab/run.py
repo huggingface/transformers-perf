@@ -3,11 +3,17 @@
 Usage: MODEL=<model> tperf ab <pr number> [rounds=6]
        MODEL=<model> HEAD_EXTRA_PATCHES=<patch> tperf ab main [rounds]   # A/B of a benchmark change itself
        MODEL=<model> HEAD_PATCHES=<patch> tperf ab main [rounds]         # A/B of a local transformers change
+       MODEL=<chat model> SERVE=chat tperf ab <pr number> [rounds]       # a multi-turn chat on `transformers serve`
 
 Environment:
   HOST          bench host, user@address (default: [host] ssh in tperf.toml)
   MODEL         model id (required)
   SCENARIOS     harness config file (.jsonl) with the scenarios to run (default: --level 1)
+  SERVE         instead of the harness, run this scenario (name or index) of SERVE_SCENARIOS on each side with
+                tperf.serve.bench: `transformers serve` from the side's checkout, a client resending the conversation
+                each turn. Each side's requests are its samples (ttft, itl, e2e, tok/s; load = server start).
+                SERVE_SCENARIOS defaults to scenarios/serve-multiturn.jsonl, SERVE_BENCH_ARGS adds tperf.serve.bench
+                arguments (BENCH_ARGS and SCENARIOS are not used)
   BENCH_ARGS    tperf.harness.run_benchmarks arguments (default: -w 5 -i 10 -b 1 -s 128 -n 64). A PR changes the
                 cost of prefill and/or of each decode step, so a few dozen decode steps show it as well as hundreds:
                 raise -n only when the change needs a longer sequence (e.g. crossing a sliding window)
@@ -48,6 +54,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 
 from tperf.common.benchlib import (
@@ -90,6 +97,16 @@ def main(argv: list[str] | None = None) -> None:
     harness_patches = patches("HARNESS_PATCHES")
     head_patches = patches("HEAD_PATCHES")
     head_extra_patches = patches("HEAD_EXTRA_PATCHES")
+    serve = os.environ.get("SERVE", "")
+    serve_scenarios = os.environ.get("SERVE_SCENARIOS", str(ROOT / "scenarios/serve-multiturn.jsonl"))
+    serve_extra = shlex.split(os.environ.get("SERVE_BENCH_ARGS", ""))
+    if serve:
+        from tperf.serve.run import SERVE_IMPORTS, scenario_index
+
+        if tp > 1:
+            die("SERVE runs one GPU per side (TP=1)")
+        serve_index = scenario_index(Path(serve_scenarios), serve)
+        bench_args = shlex.join(["serve", serve, *serve_extra])
 
     if len(gpus) != 2:
         die("GPUS needs two GPU groups (one GPU each without TP)")
@@ -177,7 +194,12 @@ def main(argv: list[str] | None = None) -> None:
             push_package(f"{ab}/src-head")
             apply_patches("src-head", shared + head_extra_patches, prefix="src-head-", strip=2)
         scen_arg = ["--level", "1"]
-        if scenarios:
+        if serve:
+            scen_arg = []
+            scp_to([serve_scenarios], f"{ab}/serve-scenarios.jsonl")
+            if ssh([PY, "-c", SERVE_IMPORTS], check=False).returncode:
+                die("the bench host's harness venv lacks transformers' serving dependencies: run `tperf host install`")
+        elif scenarios:
             scp_to([scenarios], f"{ab}/scenarios.jsonl")
             scen_arg = ["--config-file", f"{ab}/scenarios.jsonl"]
         for side in ("base", "head"):
@@ -197,7 +219,8 @@ def main(argv: list[str] | None = None) -> None:
         lines += [
             f"head_patches={names(head_patches)}",
             f"head_extra_patches={names(head_extra_patches)}",
-            f"bench_args={bench_args} scenarios={scenarios or 'level 1'} harness={version} "
+            f"bench_args={bench_args} scenarios={serve_scenarios if serve else scenarios or 'level 1'} "
+            f"harness={version} "
             f"harness_patches={names(harness_patches)}",
         ]
         (out / "ab.txt").write_text("\n".join(lines) + "\n")
@@ -246,14 +269,24 @@ def main(argv: list[str] | None = None) -> None:
                 "--group", f"{ab_id}-r{rnd}-{side}", "--run", 1,
                 "--label", f"ab-{name}-{side}" + (f"-tp{tp}" if tp > 1 else ""),
             ]  # fmt: skip
+            workload = [
+                *launch, "-m", "tperf.harness.run_benchmarks", "--output-dir", out_dir, "--model-id", model,
+                *shlex.split(bench_args), *scen_arg, *tp_args, "--no-gpu-monitoring", "--commit-id", sha,
+                "--log-level", "WARNING",
+            ]  # fmt: skip
+            if serve:
+                # the server inherits this process's CPUs and memory node; HF_HUB_OFFLINE: the model is downloaded
+                run_env.update(HF_HUB_OFFLINE=1, OMP_NUM_THREADS=ncores)
+                workload = [
+                    PY, "-m", "tperf.serve.bench", "--model-id", model, "--out", f"{out_dir}/serve", "--python", PY,
+                    "--commit", sha, "--config-file", f"{ab}/serve-scenarios.jsonl", "--scenario-index", serve_index,
+                    *serve_extra,
+                ]  # fmt: skip
             run = [
                 *env_args(run_env),
                 "numactl", f"--physcpubind={cpus[node]}", f"--membind={node}",
                 *remote_module(PY, "common.noise_probe", env["PYTHONPATH"]),
-                "--cpus", cpus[node], "--gpu", gpu, "--out", f"{out_dir}/probe.json",
-                "--", *launch, "-m", "tperf.harness.run_benchmarks", "--output-dir", out_dir, "--model-id", model,
-                *shlex.split(bench_args), *scen_arg, *tp_args, "--no-gpu-monitoring", "--commit-id", sha,
-                "--log-level", "WARNING",
+                "--cpus", cpus[node], "--gpu", gpu, "--out", f"{out_dir}/probe.json", "--", *workload,
             ]  # fmt: skip
             return (
                 f"mkdir -p {out_dir} && rm -rf {cc} && cd {out_dir} && {cmd(manifest)} && "

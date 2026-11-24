@@ -110,6 +110,12 @@ def value(row: dict, prefix: str):
 
 
 def scenario_label(row: dict) -> str:
+    # tperf ab with SERVE: a multi-turn chat on transformers serve
+    if (row.get("scenario") or "").startswith("serve:"):
+        extras = [x for x, on in (("compiled", row.get("compile_mode")), ("continuous batching",
+                  row.get("continuous_batching"))) if on]  # fmt: skip
+        return " · ".join([f"transformers serve, {row['scenario'][6:]}", *extras,
+                           f"{row['n_samples']} requests of {row['num_tokens_to_generate']} tokens"])  # fmt: skip
     parts = [row.get("attn_implementation") or "?"]
     if row.get("compile_mode") is not None:
         parts.append("compiled")

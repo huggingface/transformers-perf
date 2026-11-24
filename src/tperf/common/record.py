@@ -27,6 +27,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import statistics
 import subprocess
 import sys
@@ -254,11 +255,57 @@ def flat_probe(probe: dict) -> dict:
     }
 
 
+def series_key(row: dict) -> str:
+    """Series of comparable measurements: same workload on the same hardware and clocks. Software versions (commit,
+    torch, driver) are what the dashboard tracks within a series."""
+    key = [row[k] for k in ("model_id", "scenario", "instance_type", "gpu_name", "sm_clock_mhz")]
+    return hashlib.sha256(json.dumps(key).encode()).hexdigest()[:16]
+
+
+def serve_row(manifest: dict, results: dict) -> dict:
+    """A `tperf.serve.bench` run (results.json) as one row: every measured request of every turn is a sample, so the
+    row's ttft / itl / e2e / tokens_per_s statistics read like the harness's, and `tperf ab` compares them the same way.
+    The scenario is named `serve:<name>`."""
+    a = results.get("args") or {}
+    turns = results.get("turns") or []
+    attn = re.search(r"--attn-implementation[ =](\S+)", a.get("server_args") or "")
+    row = {
+        **manifest,
+        "scenario": f"serve:{results.get('scenario') or 'custom'}",
+        "attn_implementation": attn.group(1) if attn else None,
+        "compile_mode": "default" if "--compile" in (a.get("server_args") or "").split() else None,
+        "kernelize": False,
+        "continuous_batching": "--continuous-batching" in (a.get("server_args") or "").split(),
+        "tp": False,
+        "batch_size": a.get("concurrency"),
+        "sequence_length": a.get("system_tokens"),
+        "num_tokens_to_generate": a.get("max_tokens"),
+        "warmup_iterations": a.get("warmup"),
+        "measurement_iterations": len(turns),
+        "success": not results.get("error") and bool(turns),
+        "n_samples": len(turns),
+        "startup_load_time_s": results.get("startup_s"),
+    }
+    for name, values, scale in (
+        ("e2e_ms", [t["e2e_s"] for t in turns], 1e3),
+        ("ttft_ms", [t["ttft_s"] for t in turns], 1e3),
+        ("itl_ms", [t["itl_ms"] for t in turns if t.get("itl_ms") is not None], 1.0),
+        ("tokens_per_s", [t["completion_tokens"] / t["e2e_s"] for t in turns if t["e2e_s"] > 0], 1.0),
+    ):
+        for stat, value in stats(values, scale).items():
+            row[f"{name}_{stat}"] = value
+    row["series_key"] = series_key(row)
+    return row
+
+
 def scenario_rows(run_dir: Path) -> list[dict]:
     manifest = json.loads((run_dir / "manifest.json").read_text())
     probe_path = run_dir / "probe.json"
     probe = flat_probe(json.loads(probe_path.read_text())) if probe_path.exists() else {}
     rows = []
+    serve = run_dir / "serve" / "results.json"  # a `tperf ab` side run with SERVE
+    if serve.exists():
+        rows.append(serve_row(manifest, json.loads(serve.read_text())) | probe)
     for file in sorted(run_dir.rglob("*_benchmark_*.json")):
         for entry in json.loads(file.read_text()).values():
             config, meas, meta = entry["config"], entry["measurements"], entry["metadata"]
@@ -293,10 +340,7 @@ def scenario_rows(run_dir: Path) -> list[dict]:
                 for stat, value in stats(values, scale).items():
                     row[f"{name}_{stat}"] = value
             row.update(flat_startup(meas.get("startup") or {}))
-            # Series of comparable measurements: same workload on the same hardware and clocks. Software versions
-            # (commit, torch, driver) are what the dashboard tracks within a series.
-            key = [row[k] for k in ("model_id", "scenario", "instance_type", "gpu_name", "sm_clock_mhz")]
-            row["series_key"] = hashlib.sha256(json.dumps(key).encode()).hexdigest()[:16]
+            row["series_key"] = series_key(row)
             rows.append(row | probe)
     return rows
 
