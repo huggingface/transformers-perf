@@ -166,6 +166,7 @@ def chat_turn(port: int, model_id: str, messages: list[dict], max_tokens: int, f
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     chunks: list[float] = []
     content: list[str] = []
+    reasoning: list[str] = []  # a reasoning model's thinking (e.g. Qwen3) streams as `reasoning_content` deltas
     usage: dict = {}
     finish = None
     try:
@@ -190,10 +191,12 @@ def chat_turn(port: int, model_id: str, messages: list[dict], max_tokens: int, f
             if "error" in event:
                 raise RuntimeError(f"server error: {event['error']}")
             for choice in event.get("choices") or []:
-                piece = (choice.get("delta") or {}).get("content")
-                if piece:
-                    chunks.append(now)
-                    content.append(piece)
+                delta = choice.get("delta") or {}
+                for key, parts in (("reasoning_content", reasoning), ("content", content)):
+                    piece = delta.get(key)
+                    if piece:
+                        chunks.append(now)
+                        parts.append(piece)
                 finish = choice.get("finish_reason") or finish
             usage = event.get("usage") or usage
         end = time.perf_counter()
@@ -205,7 +208,9 @@ def chat_turn(port: int, model_id: str, messages: list[dict], max_tokens: int, f
     gaps = sorted((b - a) * 1e3 for a, b in zip(chunks, chunks[1:]))
     decode = chunks[-1] - chunks[0]
     return {
-        "reply": "".join(content),
+        # the next turn resends the reply; a reply that was all thinking goes back as text, so the history still grows
+        "reply": "".join(content) or "".join(reasoning),
+        "reasoning_chars": sum(map(len, reasoning)),
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": completion,
         "finish_reason": finish,

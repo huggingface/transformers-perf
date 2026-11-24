@@ -19,6 +19,7 @@ class FakeChat(BaseHTTPRequestHandler):
     """Streams `max_tokens` one-token chunks the way transformers serve does, then a usage chunk."""
 
     requests: list = []
+    reasoning = 0  # how many leading tokens stream as `reasoning_content` (a thinking model, e.g. Qwen3)
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -33,7 +34,8 @@ class FakeChat(BaseHTTPRequestHandler):
 
         send({"choices": [{"delta": {"role": "assistant"}, "index": 0}]})
         for i in range(body["max_tokens"]):
-            send({"choices": [{"delta": {"content": f"w{i} "}, "index": 0}]})
+            key = "reasoning_content" if i < FakeChat.reasoning else "content"
+            send({"choices": [{"delta": {key: f"w{i} "}, "index": 0}]})
         prompt = sum(len(m["content"].split()) for m in body["messages"])
         send({"choices": [{"delta": {}, "finish_reason": "length", "index": 0}],
               "usage": {"prompt_tokens": prompt, "completion_tokens": body["max_tokens"]}})  # fmt: skip
@@ -48,6 +50,7 @@ def fake_server():
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     FakeChat.requests = []
+    FakeChat.reasoning = 0
     yield server.server_address[1]
     server.shutdown()
 
@@ -64,6 +67,16 @@ def test_chat_turn_streams_and_times(fake_server):
     assert json.loads(sent["generation_config"]) == {"max_new_tokens": 5, "min_new_tokens": 5, "do_sample": False}
     chat_turn(fake_server, "m", messages, max_tokens=5, fixed_length=False, timeout=10)
     assert "generation_config" not in FakeChat.requests[1]
+
+
+def test_reasoning_deltas_count_as_streamed_tokens(fake_server):
+    messages = [{"role": "user", "content": "hello"}]
+    FakeChat.reasoning = 5  # all thinking: before the fix, "the server streamed no content"
+    r = chat_turn(fake_server, "m", messages, max_tokens=5, fixed_length=True, timeout=10)
+    assert r["chunks"] == 5 and r["reply"] == "w0 w1 w2 w3 w4 "
+    FakeChat.reasoning = 2  # thinking then an answer: timings span both, the history gets the answer
+    r = chat_turn(fake_server, "m", messages, max_tokens=5, fixed_length=True, timeout=10)
+    assert r["chunks"] == 5 and r["reply"] == "w2 w3 w4 "
 
 
 def test_conversation_resends_the_history(fake_server, tmp_path):
