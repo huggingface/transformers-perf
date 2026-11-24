@@ -13,6 +13,9 @@ Each suite runs RUNS times on its own GPU; suites on GPUs of different NUMA node
 manifest, noise probe, fresh compile caches. Rows are published with source=main, label daily-<suite>.
 Then the "processors" suite: tperf.processors.bench on scenarios/processors.jsonl, RUNS times, pinned to NCORES cores of
 node 0 and GPU 0 (free once the GPU suites are done), published to processors/ with label daily-processors.
+Then, once nothing timed runs any more, one memory profile per GPU suite (tperf.memory.profile: the suite's model,
+shapes and first scenario, every allocation recorded), published to memory/<month>/<group>/ in the dataset and linked
+from the dashboard's daily points. MEMORY_PROFILE=0 skips it; a failed profile is logged and fails nothing.
 Skipped (exit 0) if a benchmark is already running on the host.
 
 To try other settings the same way (e.g. a shorter run), without touching the daily series:
@@ -48,6 +51,7 @@ ARGS = os.environ.get("ARGS", "")  # tperf.harness.run_benchmarks arguments repl
 LABEL_PREFIX = os.environ.get("LABEL_PREFIX") or "daily"  # rows are <prefix>-<suite>; the dashboard's are daily-*
 NCORES = int(os.environ.get("NCORES") or 8)
 GPU_NUMA_MAP = [int(n) for n in (os.environ.get("GPU_NUMA_MAP") or "0 0 0 0 1 1 1 1").split()]
+MEMORY_PROFILE = os.environ.get("MEMORY_PROFILE", "1") != "0"
 PROC_PYTHONPATH_EXTRA = "/opt/bench/proc-deps"  # torchvision and Pillow, not in the tbv2-venv
 
 # suite name -> (gpu, model, bench args, scenarios file or None for --level 1)
@@ -183,6 +187,38 @@ class Daily:
                 shutil.rmtree(cc, ignore_errors=True)
         return ok
 
+    def run_memory_profiles(self, suites: list[str]) -> None:
+        """One memory profile per suite, each on its suite's GPU, all at once, then published. Informative only."""
+        procs = []
+        for s in suites:
+            gpu, model, args, scen = SUITES[s]
+            node = GPU_NUMA_MAP[gpu]
+            shapes = shlex.split(ARGS or args)
+            # The suite's shapes; its warmup and iteration counts are for timing, not for this
+            keep = [
+                x
+                for i, x in enumerate(shapes)
+                if x in ("-b", "-s", "-n") or (i and shapes[i - 1] in ("-b", "-s", "-n"))
+            ]
+            d = self.out / s / "memory"
+            d.mkdir(parents=True, exist_ok=True)
+            env = dict(os.environ, PYTHONPATH=f"{SRC}:{self.w}/src", CUDA_VISIBLE_DEVICES=str(gpu))
+            with open(self.out / s / "memory.log", "w") as logf:
+                proc = subprocess.Popen(
+                    argv("numactl", f"--physcpubind={cpus_for(node)}", f"--membind={node}", *module("memory.profile"),
+                     "--model-id", model, "--out", d, "--no-keep-snapshot", *keep,
+                     *(["--config-file", scen, "--scenario-index", 0] if scen else [])),
+                    cwd="/tmp", env=env, stdout=logf, stderr=subprocess.STDOUT,
+                )  # fmt: skip
+            procs.append((s, d, proc))
+        for s, d, proc in procs:
+            if proc.wait() or not (d / "report.html").exists():
+                log(f"warning: memory profile of {s} failed, see {self.out}/{s}/memory.log")
+                continue
+            group = f"{self.stamp}-{LABEL_PREFIX}-{s}"
+            if not last_line([*module("memory.publish"), d, "--repo", PUBLISH_REPO, "--group", group], f"{s}: "):
+                log(f"warning: publishing the memory profile of {s} failed")
+
     def run_processors(self) -> bool:
         """All runs of the processors suite, then publish them as one group."""
         cpus = cpus_for(0)
@@ -253,6 +289,9 @@ for m in {{s['model'] for s in scenarios if s.get('stage', 'processor') != 'proc
             if not last_line([*module("common.record"), "publish", *runs, "--repo", PUBLISH_REPO], f"{s}: "):
                 log(f"error: publishing {s} failed")
                 ok = False
+        if MEMORY_PROFILE and gpu_suites:
+            log("memory profiles")
+            self.run_memory_profiles(gpu_suites)
         if DASHBOARD_SPACE:
             dash = [*module("dashboard.build"), "--dataset", PUBLISH_REPO,
                     "--out", D / "dashboard", "--publish", DASHBOARD_SPACE]  # fmt: skip

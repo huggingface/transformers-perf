@@ -31,6 +31,10 @@ A *run* is one harness (`tperf.harness.run_benchmarks`) invocation. Runs repeate
 | `instance_type`, `cpu_model`, `kernel`, `gpu_name`, `gpu_index`, `numa_node`, `cpus`, `driver_version`, `sm_clock_mhz`, `mem_clock_mhz`, `power_limit_w`, `gpu_temp_c_before` | hardware and clocks |
 | `python_version`, `torch_version`, `torch_cuda`, `transformers_version`, `kernels_version`, `numa_balancing`, `aslr` | software |
 | `probe_*` | interference over the whole run, read from counters before and after (nothing runs during measurements): CPU time on the benchmark's CPUs used by others (`foreign_cpu_s`), run-queue wait, context switches, interrupts, GPU utilization, average power, power/thermal throttling |
+| `startup_weights_mb`, `startup_weights_buffers_mb`, `startup_weights_dtypes` | the model's own tensors after load (tied weights counted once); dtypes as `bfloat16:2048.0,float32:3.1` (MB) |
+| `startup_load_host_peak_rss_mb`, `startup_load_host_rss_anon_mb`, `startup_load_host_rss_file_mb`, `startup_load_disk_read_mb`, `startup_load_file_read_mb`, `startup_load_device_allocated_mb` | model load: host peak RSS, anonymous (copies) versus file-backed (mmap'd safetensors) RSS, MB fetched from storage (read calls and page faults on mapped safetensors: the model's size on a cold load, near zero from the page cache) and MB through read calls (mapped files excluded), device memory after it |
+| `startup_{first_generate,measurement}_{working_set_mb,peak_reserved_mb,alloc_retries}` | per phase: peak allocated above what was held when it started (KV cache, activations, workspaces), the allocator's peak reserve, and allocations it had to retry after freeing its cache |
+| `startup_generate_host_peak_rss_mb`, `startup_process_gpu_mb`, `startup_non_torch_gpu_mb` | host peak RSS over the generations; after them, GPU memory NVML charges the process, and the part outside torch's allocator (CUDA context, library workspaces) |
 | `series_key` | hash of model, scenario, instance type, GPU and SM clock: rows with the same key are comparable |
 
 ## Querying

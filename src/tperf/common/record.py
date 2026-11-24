@@ -34,7 +34,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # 2: startup_* memory and disk columns
 TRANSFORMERS_DIR = os.environ.get("TRANSFORMERS_DIR", "/opt/bench/transformers")
 
 
@@ -191,6 +191,15 @@ def split_itl(timestamps: list | None) -> tuple[list[float], list[float]]:
 
 COMPILE_PHASES = ("first_generate", "warmup", "measurement")
 COMPILE_COUNTERS = ("compiled_graphs", "graph_breaks", "fxgraph_cache_hits", "fxgraph_cache_misses")
+# Memory and disk, read at phase boundaries (tperf.harness.framework.memory_metrics); all in MB but the retry counts
+MEMORY_PHASES = ("first_generate", "measurement")
+MEMORY_PHASE_COLUMNS = ("working_set_mb", "peak_reserved_mb", "alloc_retries")
+MEMORY_COLUMNS = (
+    *("load_host_peak_rss_mb", "load_host_rss_anon_mb", "load_host_rss_file_mb", "load_disk_read_mb"),
+    *("load_file_read_mb", "load_device_allocated_mb", "weights_mb", "weights_buffers_mb", "weights_dtypes"),
+    *(f"{phase}_{column}" for phase in MEMORY_PHASES for column in MEMORY_PHASE_COLUMNS),
+    *("generate_host_peak_rss_mb", "process_gpu_mb", "non_torch_gpu_mb"),
+)
 STARTUP_COLUMNS = [
     "startup_load_time_s",
     "startup_first_generate_ms",
@@ -199,12 +208,13 @@ STARTUP_COLUMNS = [
     "startup_first_generate_peak_memory_mb",
     "startup_measurement_peak_memory_mb",
     *(f"startup_{phase}_{counter}" for phase in COMPILE_PHASES for counter in COMPILE_COUNTERS),
+    *(f"startup_{column}" for column in MEMORY_COLUMNS),
 ]
 
 
 def flat_startup(startup: dict) -> dict:
     """Startup metrics saved by harness: load time, cold first generation,
-    warmup latencies, torch.compile counters per phase, peak memory."""
+    warmup latencies, torch.compile counters per phase, peak memory, memory and disk per phase."""
     if not startup:
         return {}
     ms = lambda x: x * 1e3 if x is not None else None  # noqa: E731
@@ -220,6 +230,8 @@ def flat_startup(startup: dict) -> dict:
     for phase in COMPILE_PHASES:
         for counter in COMPILE_COUNTERS:
             row[f"startup_{phase}_{counter}"] = startup.get(f"{phase}_{counter}")
+    for column in MEMORY_COLUMNS:
+        row[f"startup_{column}"] = startup.get(column)
     return row
 
 
@@ -315,8 +327,10 @@ COLUMNS = [
 def null_column_type(name: str):
     import pyarrow as pa
 
-    if name.endswith(COMPILE_COUNTERS):
+    if name.endswith((*COMPILE_COUNTERS, "alloc_retries")):
         return pa.int64()
+    if name == "startup_weights_dtypes":
+        return pa.string()
     if name in METRIC_COLUMNS or name.startswith(("probe_", "startup_")):
         return pa.float64()
     return pa.int64() if name in ("pr_number", "ab_round") else pa.string()
