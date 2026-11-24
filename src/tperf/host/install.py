@@ -130,6 +130,10 @@ def main() -> None:
         pipv("-e", f"{tf}[torch]")
         # The harness's dependencies (`host` extra in pyproject.toml), without amdsmi / pyzes (AMD / Intel monitoring)
         pipv("numpy", "psutil", "nvidia-ml-py", "datasets", "huggingface_hub")
+    # memray: host allocations in `tperf memory profile` (not imported by measured runs)
+    if not succeeds(tbv2_py, "-c", "import memray"):
+        log("Installing memray")
+        pipv("memray")
     # kernels: lets harness run flash_attention_2 (kernel fetched from the Hub on first use)
     # and the kernelized scenarios. transformers at TF_COMMIT requires kernels>=0.18.2,<0.19.
     kernels_ok = f"import importlib.metadata as m, sys; sys.exit(m.version('kernels') != '{KERNELS_VERSION}')"

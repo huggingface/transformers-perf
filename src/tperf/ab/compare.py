@@ -39,11 +39,18 @@ METRICS = {
     "load": ("startup_load_time_s", False),
     "cold": ("startup_first_generate_ms", False),  # first generation: compilation, CUDA graphs
     "mem": ("startup_measurement_peak_memory_mb", False),  # peak memory during the measurements
+    # Memory read at phase boundaries (tperf.harness.framework.memory_metrics)
+    "weights": ("startup_weights_mb", False),  # the model's own tensors
+    "gpu ws": ("startup_measurement_working_set_mb", False),  # peak above the weights: KV cache, activations
+    "reserved": ("startup_measurement_peak_reserved_mb", False),  # the caching allocator's peak reserve
+    "gpu proc": ("startup_process_gpu_mb", False),  # what NVML charges the process (CUDA context included)
+    "load rss": ("startup_load_host_peak_rss_mb", False),  # host peak RSS while loading
 }
 # Counted, not timed: printed per side (median over rounds) rather than compared as ratios
 COUNTERS = {
     "compiled graphs": "compiled_graphs",
     "graph breaks": "graph_breaks",
+    "alloc retries": "alloc_retries",  # first generation / measurement (no warmup value)
 }
 # Two-sided 95% t quantiles by degrees of freedom
 T95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228}
@@ -103,7 +110,7 @@ def analyze(rows: list[dict], threshold: float = 1.0) -> dict:
             y, o = [], []
             for _, sides in pairs:
                 b, h = sides["base"].get(col), sides["head"].get(col)
-                if _num(b) and _num(h):
+                if _num(b) and _num(h) and b > 0 and h > 0:  # ratios of positive values only
                     sign = -1 if higher_is_better else 1  # positive = head worse
                     y.append(sign * math.log(h / b))
                     o.append(1.0 if sides["head"]["gpu_index"] == gpus[-1] else -1.0)

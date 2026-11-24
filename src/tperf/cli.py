@@ -32,6 +32,10 @@ COMMANDS: dict[str, dict[str, tuple[str, str]]] = {
         "profile": ("tperf.tp.profile_run", "one TP decode step broken down per rank"),
         "summarize": ("tperf.tp.summarize", "print tp profile results (tp*.jsonl)"),
     },
+    "memory": {
+        "profile": ("tperf.memory.run", "where memory goes in one scenario: HTML report"),
+        "report": ("tperf.memory.report", "rebuild report.html from a profile directory"),
+    },
     "baselines": {
         "run": ("tperf.baselines.run", "bf16 GEMM and host<->device bandwidth"),
         "repeat": ("tperf.baselines.repeat", "repeat the baselines and compare the runs"),

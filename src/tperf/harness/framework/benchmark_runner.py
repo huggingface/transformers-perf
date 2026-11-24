@@ -32,6 +32,15 @@ from transformers.utils import is_torch_accelerator_available
 from .benchmark_config import BenchmarkConfig
 from .data_classes import BenchmarkMetadata, BenchmarkResult, GPURawMetrics, pretty_print_dict
 from .hardware_metrics import GPUMonitor
+from .memory_metrics import (
+    MB,
+    device_memory,
+    dtypes_string,
+    host_memory,
+    model_breakdown,
+    process_gpu_memory_mb,
+    reset_host_peak,
+)
 from .validation import validate_generation_outputs
 
 
@@ -236,6 +245,9 @@ class BenchmarkRunner:
         # `distributed_config` and `device_map` are mutually exclusive — TP does its own placement.
         distributed_config = config.distributed_config
         device_map = config.device if distributed_config is None else None
+        # Read before and after the timed load, never inside it
+        host_before = host_memory()
+        peak_reset = reset_host_peak()
         load_start = time.perf_counter()
         self.model = AutoModelForCausalLM.from_pretrained(
             model_id,
@@ -249,6 +261,7 @@ class BenchmarkRunner:
         self.model = self.model.eval()
         self.torch_accelerator_module.synchronize()
         self.load_time = time.perf_counter() - load_start
+        self.load_memory = self._memory_guard(self._load_memory, host_before, peak_reset)
         self.inputs = self.inputs.to(self.model.device)
         self.continuous_batching_config = (
             ContinuousBatchingConfig(allow_block_sharing=False, auto_switch_to_flash=False)
@@ -280,12 +293,14 @@ class BenchmarkRunner:
 
             # Startup metrics are read outside the measured generations (timers around whole calls, counters that
             # torch keeps anyway), so collecting them adds no work to the measurements
-            startup = {"load_time": getattr(self, "load_time", None)}
+            startup = {"load_time": getattr(self, "load_time", None), **getattr(self, "load_memory", {})}
+            host_peak_reset = reset_host_peak()
 
             # Quick validation: try one measurement first to see if this scenario works. This first call is the cold
             # start: compilation, CUDA graph capture, kernel loading.
             flush_memory()
             compile_counts = self._compile_counters()
+            memory_before = device_memory(self.torch_accelerator_module)
             self._reset_peak_memory()
             e2e_latency = self.time_generate(config, warmup=True)[0]
             if e2e_latency < 0:
@@ -293,6 +308,7 @@ class BenchmarkRunner:
                 return None
             startup["first_generate_latency"] = e2e_latency
             startup["first_generate_peak_memory_mb"] = self._peak_memory_mb()
+            startup.update(self._memory_guard(self._phase_memory, "first_generate", memory_before))
             startup.update(self._compile_counters_since(compile_counts, "first_generate"))
 
             # Warmup runs
@@ -309,6 +325,7 @@ class BenchmarkRunner:
             result.execution_settings = self.execution_settings
             self.logger.info(f"Benchmarking with {config.measurement_iterations} iterations.")
             compile_counts = self._compile_counters()
+            memory_before = device_memory(self.torch_accelerator_module)
             self._reset_peak_memory()
             for _ in trange(config.measurement_iterations, desc="Benchmarking"):
                 e2e_latency, timestamps, shape_and_decoded_output, gpu_metrics = self.time_generate(
@@ -319,6 +336,8 @@ class BenchmarkRunner:
             # Anything compiled here means the measurements were not steady state
             startup.update(self._compile_counters_since(compile_counts, "measurement"))
             startup["measurement_peak_memory_mb"] = self._peak_memory_mb()
+            startup.update(self._memory_guard(self._phase_memory, "measurement", memory_before))
+            startup.update(self._memory_guard(self._resident_memory, host_peak_reset))
             if startup["measurement_compiled_graphs"]:
                 self.logger.warning(
                     f"{config.name}: {startup['measurement_compiled_graphs']} graph(s) compiled during measurements"
@@ -346,6 +365,65 @@ class BenchmarkRunner:
 
     def _compile_counters_since(self, before: dict[str, int], phase: str) -> dict[str, int]:
         return {f"{phase}_{k}": v - before[k] for k, v in self._compile_counters().items()}
+
+    def _memory_guard(self, func, *args) -> dict[str, Any]:
+        """Memory counters are informative: a failure to read one is logged, never fails the scenario."""
+        try:
+            return func(*args)
+        except Exception as e:
+            self.logger.warning(f"Could not read memory counters ({func.__name__}): {e!r}")
+            return {}
+
+    def _load_memory(self, host_before: dict, peak_reset: bool) -> dict[str, Any]:
+        """Host memory and reads of the load, the model's tensors by dtype and module, device memory after it."""
+        host = host_memory()
+        device = device_memory(self.torch_accelerator_module)
+        weights = model_breakdown(self.model)
+
+        def delta(key: str) -> float | None:
+            if host.get(key) is None or host_before.get(key) is None:
+                return None
+            return (host[key] - host_before[key]) / MB
+
+        return {
+            "load_host_peak_rss_mb": host.get("rss_peak_mb") if peak_reset else None,
+            "load_host_rss_anon_mb": host.get("rss_anon_mb"),
+            "load_host_rss_file_mb": host.get("rss_file_mb"),
+            "load_disk_read_mb": delta("read_bytes"),
+            "load_file_read_mb": delta("rchar"),
+            "load_device_allocated_mb": device.get("allocated_mb"),
+            "weights_mb": weights["weights_mb"],
+            "weights_buffers_mb": weights["buffers_mb"],
+            "weights_dtypes": dtypes_string(weights["by_dtype_mb"]),
+            "weights_by_device_mb": weights["by_device_mb"],
+            "weights_top_modules_mb": weights["top_modules_mb"],
+        }
+
+    def _phase_memory(self, phase: str, before: dict) -> dict[str, Any]:
+        """What a phase added on the device: its peak above the memory already held when it started (KV cache,
+        activations, workspaces: the model's weights excluded), the allocator's peak reserve, and its retries."""
+        after = device_memory(self.torch_accelerator_module)
+        if not after or not before:
+            return {}
+        return {
+            f"{phase}_working_set_mb": after["peak_allocated_mb"] - before["allocated_mb"],
+            f"{phase}_peak_reserved_mb": after["peak_reserved_mb"],
+            f"{phase}_alloc_retries": after["alloc_retries"] - before["alloc_retries"],
+        }
+
+    def _resident_memory(self, host_peak_reset: bool) -> dict[str, Any]:
+        """After the measurements (the allocator's cache emptied): what NVML charges this process, and the part the
+        caching allocator does not account for (CUDA context, library workspaces, other allocators); host peak RSS
+        over the generations."""
+        out: dict[str, Any] = {}
+        host = host_memory()
+        out["generate_host_peak_rss_mb"] = host.get("rss_peak_mb") if host_peak_reset else None
+        if self.device_type == "cuda":
+            process = process_gpu_memory_mb(torch.cuda.current_device())
+            reserved = device_memory(self.torch_accelerator_module).get("reserved_mb")
+            out["process_gpu_mb"] = process
+            out["non_torch_gpu_mb"] = process - reserved if process is not None and reserved is not None else None
+        return out
 
     def _reset_peak_memory(self) -> None:
         if hasattr(self.torch_accelerator_module, "reset_peak_memory_stats"):

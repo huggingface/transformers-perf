@@ -31,10 +31,13 @@ the daily suite is not a separate CUDA-graphs-on/off experiment. The harness sup
 including `max-autotune-no-cudagraphs`, for targeted comparisons. First-call and warm-up timings are recorded
 separately, along with compile/graph-break counters; compilation during the measurement phase is flagged.
 
-**Speed versus memory.** The dashboard's generation charts focus on latency and throughput. Raw harness results also
-record peak PyTorch-allocated GPU memory for the first generation and measurement phases, plus model-load timing.
-That is not total device memory usage, and the daily dashboard is not a memory-capacity or memory/speed trade-off
-sweep. Inspect the raw results when investigating startup, compilation, or allocation costs.
+**Speed versus memory.** The dashboard's generation charts focus on latency and throughput. Every run also records
+memory and disk counters at phase boundaries (`startup_*` columns, read between timed regions, never sampled): the
+model's tensors by dtype, what load read from disk versus the page cache and its host RSS (anonymous versus
+file-backed), each phase's GPU working set above the weights, the allocator's peak reserve and retries, and what NVML
+charges the process. These say how much, not what: `tperf memory profile` reruns one scenario with every GPU and host
+allocation recorded and writes an HTML report of what held memory at the peak and which code allocated it. Its
+timings mean nothing, so it is never part of a measured run.
 
 ### Coverage and how to read a result
 
@@ -81,6 +84,7 @@ tperf processors run                   # processors and encoders
 tperf baselines run                    # GEMM and host<->device bandwidth
 MODEL=meta-llama/Llama-2-7b-hf NCORES=6 tperf noise soak --hours 3   # how noisy is this host? (run on two, then
                                        #   tperf noise summarize <soak> <soak>)
+MODEL=google/gemma-3-1b-it tperf memory profile 49542   # where memory goes, as results/<ts>-memory/profile/report.html
 tperf --help                           # every command
 ```
 

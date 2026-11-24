@@ -297,16 +297,22 @@ function renderSeries() {
     }
     card.append(head, chart(s.points, metric, m.unit));
     const latest = s.points[s.points.length - 1];
+    const lastReport = s.points.slice().reverse().find((p) => p.memory);
+    if (lastReport) {  // one profiled run per suite and day (its first scenario): what held memory, who allocated it
+      const mr = el("div", { class: "meta" });
+      mr.append(el("a", { href: lastReport.memory, target: "_blank", rel: "noopener" }, `Memory report, ${day(lastReport.date)} ↗`));
+      card.append(mr);
+    }
     if (latest.sync_sources && Object.keys(latest.sync_sources).length) {
       const sd = el("details"); sd.append(el("summary", {}, `Where the ${fmt(latest.values.syncs?.[0], "syncs")} syncs come from (latest run)`));
       const ul = el("ul", { class: "sources" });
       for (const [src, n] of Object.entries(latest.sync_sources)) ul.append(el("li", {}, `${n} × ${src}`));
       sd.append(ul); card.append(sd);
     }
-    const hasOut = s.points.some((p) => p.outputs), hasSyncs = s.metrics.includes("syncs");
+    const hasOut = s.points.some((p) => p.outputs), hasSyncs = s.metrics.includes("syncs"), hasMem = s.points.some((p) => p.memory);
     const det = el("details"); det.append(el("summary", {}, "Table"));
     const tw = el("div", { class: "scroll" }), tb = el("table"), hr = el("tr");
-    for (const h of ["Date", "Commit", "Median", "Min", "Max", "Runs"].concat(hasSyncs ? ["Syncs"] : [], hasOut ? ["Output"] : [])) hr.append(el("th", {}, h));
+    for (const h of ["Date", "Commit", "Median", "Min", "Max", "Runs"].concat(hasSyncs ? ["Syncs"] : [], hasOut ? ["Output"] : [], hasMem ? ["Memory"] : [])) hr.append(el("th", {}, h));
     tb.append(hr);
     const rev = s.points.slice().reverse();
     for (const [i, p] of rev.entries()) {
@@ -318,6 +324,11 @@ function renderSeries() {
         cells.push(o + (prev && JSON.stringify(prev) !== JSON.stringify(p.outputs) ? " (changed)" : ""));
       }
       for (const c of cells) tr.append(el("td", {}, c));
+      if (hasMem) {
+        const td = el("td");
+        if (p.memory) td.append(el("a", { href: p.memory, target: "_blank", rel: "noopener" }, "report"));
+        tr.append(td);
+      }
       tb.append(tr);
     }
     tw.append(tb); det.append(tw); card.append(det);
@@ -329,7 +340,7 @@ function renderSeries() {
 const VERDICT = (v) => v.startsWith("REGRESSION") ? ["regression", "regression"] : v.startsWith("improvement") ? ["improvement", "improvement"]
   : v.startsWith("no change") ? ["same", "no change"] : ["inconclusive", "inconclusive"];
 const AB_METRICS = ["e2e", "ttft", "itl_h1", "itl_h2", "cold", "mem"];
-const AB_LABELS = { e2e: "e2e", ttft: "TTFT", itl: "ITL", itl_h1: "ITL 1st half", itl_h2: "ITL 2nd half", "tok/s": "tok/s", cold: "cold start", mem: "peak memory", load: "load" };
+const AB_LABELS = { e2e: "e2e", ttft: "TTFT", itl: "ITL", itl_h1: "ITL 1st half", itl_h2: "ITL 2nd half", "tok/s": "tok/s", cold: "cold start", mem: "peak memory", load: "load", weights: "model tensors", "gpu ws": "GPU working set", reserved: "GPU reserved", "gpu proc": "GPU process", "load rss": "load host RSS" };
 function renderAbs() {
   const box = $("abs");
   if (!D.abs.length) { box.append(el("div", { class: "empty" }, "No side-by-side runs yet.")); return; }
