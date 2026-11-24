@@ -55,6 +55,11 @@ COMMANDS: dict[str, dict[str, tuple[str, str]]] = {
         "compare": ("tperf.harness.compare_results", "compare harness results against a baseline, flag regressions"),
         "version": ("tperf.common.harness", "harness version: last commit that changed src/tperf/harness"),
     },
+    "noise": {
+        "soak": ("tperf.noise.soak", "hours of generation batches + contention probes + steal sampling on one host"),
+        "probe": ("tperf.noise.soak:probe", "one contention probe (clock, memory bandwidth, L3/DRAM latency)"),
+        "summarize": ("tperf.noise.summarize", "compare soaks side by side: tperf noise summarize <soak> <soak>"),
+    },
     "dashboard": {"build": ("tperf.dashboard.build", "build (and publish) the dashboard from the dataset")},
     "record": {"": ("tperf.common.record", "host side: write a run manifest, publish runs to the dataset")},
     "daily": {"": ("tperf.daily.main", "host side: the daily main benchmark (run by bench-daily.timer)")},

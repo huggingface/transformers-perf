@@ -5,7 +5,7 @@
 - **Python, not bash.** All tooling is Python: no `.sh` files. Use `subprocess` with argument lists to call `ssh`,
   `git`, `rsync` and friends, and `argparse` for the command line.
 - **One package, one subpackage per feature.** The tooling is the `tperf` package in `src/tperf/`: one subpackage per
-  feature (`daily`, `ab`, `generation`, `processors`, `tp`, `baselines`, `host`, `dashboard`), holding its runner, the
+  feature (`daily`, `ab`, `generation`, `processors`, `tp`, `baselines`, `host`, `noise`, `dashboard`), holding its runner, the
   code it runs on the host and its summary. Code shared by several features goes in `tperf.common`; workstation
   commands import `tperf.common.benchlib`. Normal package imports (`from tperf.common.benchlib import ...`), no
   `sys.path` hacks. The generation benchmark is `tperf.harness` (`src/tperf/harness/`, run as

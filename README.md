@@ -79,6 +79,8 @@ tperf deploy                           # copy tperf (harness included) and scena
 MODEL=google/gemma-3-1b-it SCENARIOS=scenarios/sliding-window.jsonl tperf ab 49542   # a PR against its base
 tperf processors run                   # processors and encoders
 tperf baselines run                    # GEMM and host<->device bandwidth
+MODEL=meta-llama/Llama-2-7b-hf NCORES=6 tperf noise soak --hours 3   # how noisy is this host? (run on two, then
+                                       #   tperf noise summarize <soak> <soak>)
 tperf --help                           # every command
 ```
 
