@@ -15,6 +15,10 @@ Options (environment variables; `tperf host tune` passes them on from your envir
   CACHE_MOUNT=/mnt/cache  where to mount a local NVMe instance-store disk, for HF_HOME ("none" to skip)
   GPU_NUMA_MAP="0 0 0 0 1 1 1 1"  GPU index -> NUMA node, used to route each GPU's interrupts
                      to its node's housekeeping CPU (the first CPU of the node)
+  ISOLATE_MANAGED_IRQS=0  do not add isolcpus=managed_irq,<benchmark CPUs> to the kernel command line
+                     (default: added, takes effect at the next reboot). Moves kernel-managed interrupts
+                     (NVMe queues) off the benchmark CPUs when their mask also holds a housekeeping CPU;
+                     a queue bound to benchmark CPUs only still fires there, on that CPU's own I/O.
   GPU_SM_CLOCK=1500  SM clock lock in MHz, "max" (max boost clock), or "off" (no lock).
                      Must be a clock the GPU can hold under its power limit, or the power cap
                      overrides the lock and clocks drift with temperature. On g5.48xlarge (A10G,
@@ -24,7 +28,7 @@ Options (environment variables; `tperf host tune` passes them on from your envir
 The NVIDIA driver is installed from Ubuntu's prebuilt, kernel-matched modules (no DKMS build),
 and the driver and running kernel packages are put on apt hold so they cannot drift between runs.
 
-Persistence: masked units, sysctls and apt/snap settings survive a reboot. THP, KSM, C-states
+Persistence: masked units, sysctls, the kernel command line and apt/snap settings survive a reboot. THP, KSM, C-states
 and the GPU clock lock are runtime-only; "apply" installs bench-tuning.service, which
 re-applies them at boot. Re-run "apply" after changing options, so the boot unit picks them up.
 
@@ -62,6 +66,8 @@ KSM_RUN = "/sys/kernel/mm/ksm/run"
 # nvbandwidth host_device_latency_sm (GPUs 0-3 are ~110 ns closer to node 0, 4-7 to node 1).
 GPU_NUMA_MAP = os.environ.get("GPU_NUMA_MAP") or "0 0 0 0 1 1 1 1"
 KEEP_CSTATES = os.environ.get("KEEP_CSTATES", "0") == "1"
+ISOLATE_MANAGED_IRQS = os.environ.get("ISOLATE_MANAGED_IRQS", "1") != "0"
+GRUB_FILE = Path("/etc/default/grub.d/99-bench.cfg")
 
 # Long-running daemons that are not needed to run benchmarks.
 SERVICES = [
@@ -541,7 +547,42 @@ def apply_irqs() -> list[str]:
     log(f"Routing device interrupts to housekeeping CPUs: {' '.join(hk.values())} (GPU -> node map: {GPU_NUMA_MAP})")
     irq_affinity(list(hk.values()), GPU_NUMA_MAP.split())
     report_unmoved_irqs(set(hk.values()))
+    if ISOLATE_MANAGED_IRQS:
+        all_cpus = [line.split(",")[0] for line in lines(cpus) if not line.startswith("#")]
+        apply_isolcpus([int(c) for c in all_cpus if c not in hk.values()])
     return list(hk.values())
+
+
+def cpu_ranges(cpus: list[int]) -> str:
+    """[1, 2, 3, 5] -> "1-3,5"."""
+    out, cpus = [], sorted(cpus)
+    for k, group in itertools.groupby(enumerate(cpus), lambda ic: ic[1] - ic[0]):
+        run_ = [c for _, c in group]
+        out.append(f"{run_[0]}-{run_[-1]}" if len(run_) > 1 else str(run_[0]))
+    return ",".join(out)
+
+
+def apply_isolcpus(bench_cpus: list[int]) -> None:
+    """Add isolcpus=managed_irq,<benchmark CPUs> to the kernel command line (GRUB drop-in), so the kernel puts
+    managed interrupts on a housekeeping CPU whenever their mask allows it. managed_irq only: the default "domain"
+    flag would take the CPUs out of the scheduler, and threads pinned to several isolated CPUs would then never
+    spread. ("io_queue", which would stop the block layer from creating queues on them, is not in 7.0 kernels.)"""
+    if not bench_cpus:
+        return
+    arg = f"isolcpus=managed_irq,{cpu_ranges(bench_cpus)}"
+    log(f"Kernel command line: {arg}")
+    want = f'# Written by tperf/host/prepare.py\nGRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX {arg}"\n'
+    if read(str(GRUB_FILE), "") + "\n" != want:
+        GRUB_FILE.parent.mkdir(parents=True, exist_ok=True)
+        GRUB_FILE.write_text(want)
+        if not run("update-grub", check=False, quiet=True):
+            warn(f"update-grub failed: {arg} will not be on the next boot")
+            return
+        note(f"wrote {GRUB_FILE}")
+    if arg in read("/proc/cmdline").split():
+        note("active on the running kernel")
+    else:
+        warn(f"reboot required for {arg} to take effect")
 
 
 def report_unmoved_irqs(hk: set[str]) -> None:
@@ -560,7 +601,9 @@ def report_unmoved_irqs(hk: set[str]) -> None:
         requested = read(f"/proc/irq/{irq}/smp_affinity_list", "")
         effective = read(f"/proc/irq/{irq}/effective_affinity_list", "")
         if requested not in hk and requested != f"0-{os.cpu_count() - 1}":  # all CPUs: not a device IRQ we route
-            refused.setdefault(name, []).append(requested)
+            # Managed: the kernel picks the CPU. isolcpus=managed_irq makes it a housekeeping CPU when the mask has one
+            if effective not in hk:
+                refused.setdefault(name, []).append(requested)
         elif effective and effective not in hk and requested in hk:
             pending.append(name)
     if pending:
@@ -568,8 +611,9 @@ def report_unmoved_irqs(hk: set[str]) -> None:
     if refused:
         detail = " ".join(sorted(refused))
         warn(
-            f"{sum(map(len, refused.values()))} kernel-managed interrupts cannot leave the benchmark CPUs (one queue "
-            f"per CPU, fire when that CPU does I/O): {detail}"
+            f"{sum(map(len, refused.values()))} kernel-managed interrupts stay on the benchmark CPUs: their queue is"
+            f" bound to benchmark CPUs only, so they fire on that CPU's own I/O (model loading), not the timed loop."
+            f" isolcpus=managed_irq cannot move them; fewer queues would need a kernel with isolcpus io_queue: {detail}"
         )
 
 
@@ -626,6 +670,10 @@ def revert() -> None:
 
     log("Removing sysctl and apt overrides")
     SYSCTL_FILE.unlink(missing_ok=True)
+    if GRUB_FILE.is_file():
+        GRUB_FILE.unlink()
+        run("update-grub", check=False, quiet=True)
+        log(f"Removed {GRUB_FILE}: the kernel command line is back to the default at the next reboot")
     APT_FILE.unlink(missing_ok=True)
     run("sysctl", "-q", "--system", check=False, quiet=True)
 
