@@ -6,7 +6,7 @@
 Runs the scenario twice, each time in a fresh process with one recorder on, from before the model is loaded until
 the last generation:
 - GPU pass: the CUDA caching allocator's history (`torch.cuda.memory._record_memory_history`), every allocation and
-  free with the Python stack that made it -> gpu_summary.json, gpu_snapshot.pickle (pytorch.org/memory_viz)
+  free with the Python stack that made it -> gpu_summary.json, gpu_snapshot.pickle.gz (pytorch.org/memory_viz)
 - host pass: memray, native stacks included -> host.memray.bin
 Each pass also reads counters at every phase boundary (tperf.harness.framework.memory_metrics) -> profile.json.
 
@@ -58,8 +58,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--no-memray", action="store_true", help="skip the host pass")
     p.add_argument("--no-native", action="store_true", help="memray without native (C/C++) stacks: much faster")
     p.add_argument("--memray-all", action="store_true", help="keep every host allocation (large file; temporal views)")
-    p.add_argument("--keep-snapshot", action=argparse.BooleanOptionalAction, default=True,
-                   help="keep gpu_snapshot.pickle (hundreds of MB; for pytorch.org/memory_viz)")  # fmt: skip
+    p.add_argument("--keep-snapshot", action=argparse.BooleanOptionalAction, default=False,
+                   help="also keep the raw gpu_snapshot.pickle (hundreds of MB): gpu_snapshot.pickle.gz, without the "
+                   "benchmark tool's frames, is always written")  # fmt: skip
     p.add_argument("--record", choices=["both", *PASSES], default="both", help=argparse.SUPPRESS)
     return p.parse_args(argv)
 
@@ -201,11 +202,17 @@ def record(a: argparse.Namespace) -> None:
             # The report needs the summary only; the full snapshot is for memory_viz
             summary = gpu_summary(snapshot, MARKER_FUNCTION, MARKER_UNIT)
             (a.out / "gpu_summary.json").write_text(json.dumps(summary, separators=(",", ":")))
-            if a.keep_snapshot:
-                import pickle
+            import gzip
+            import pickle
 
+            from tperf.memory.report import strip_hidden_frames
+
+            if a.keep_snapshot:
                 with open(a.out / "gpu_snapshot.pickle", "wb") as f:
                     pickle.dump(snapshot, f)
+            # For PyTorch's memory viewer (served with Content-Encoding: gzip): ~25x smaller than the pickle
+            with gzip.open(a.out / "gpu_snapshot.pickle.gz", "wb", compresslevel=6) as f:
+                pickle.dump(strip_hidden_frames(snapshot), f)
 
     profile = {
         "model_id": a.model_id,
