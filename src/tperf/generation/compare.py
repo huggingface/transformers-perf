@@ -68,7 +68,7 @@ def compare(dirs: list[Path]) -> int:
 
     print("\nnoise probe (whole run)")
     print(
-        f"   {'run':<6} {'elapsed s':>9} {'foreign cpu s':>13} {'invol. csw':>10} {'irqs on cpus':>12}"
+        f"   {'run':<6} {'elapsed s':>9} {'foreign cpu s':>13} {'steal s':>8} {'invol. csw':>10} {'irqs on cpus':>12}"
         f" {'gpu util %':>10} {'power W':>8} {'throttle ms':>12}"
     )
     for d in dirs:
@@ -79,7 +79,8 @@ def compare(dirs: list[Path]) -> int:
         c, g = r["cpu"], r.get("gpu", {})
         thr = sum(g.get("throttle_ms", {}).values())
         print(
-            f"   {d.name:<6} {r['elapsed_s']:>9.1f} {c['foreign_cpu_s']:>13.2f} {c['involuntary_ctx_switches']:>10}"
+            f"   {d.name:<6} {r['elapsed_s']:>9.1f} {c['foreign_cpu_s']:>13.2f}"
+            f" {c.get('steal_s_on_cpus', float('nan')):>8.2f} {c['involuntary_ctx_switches']:>10}"
             f" {c['interrupts_on_cpus']:>12} {g.get('util_mean_pct', float('nan')):>10.1f}"
             f" {g.get('avg_power_w', float('nan')):>8.1f} {thr:>12.1f}"
         )

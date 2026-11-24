@@ -6,7 +6,9 @@ command, so the probe itself does no work while the benchmark runs:
   - CPU: /proc/stat per-CPU busy time on the benchmark's CPUs, the command's own CPU time and
     context switches (getrusage), /proc/interrupts and /proc/schedstat run-queue wait on the
     benchmark's CPUs. "foreign CPU time"
-    is busy time on the benchmark's CPUs that the command did not use (other tasks, IRQs).
+    is busy time on the benchmark's CPUs that the command did not use (other tasks, IRQs, steal).
+    "steal" is the part of it the hypervisor gave to other guests: the shared-VM signal (0 on a
+    whole-host instance).
   - GPU: NVML's own driver-side utilization sample buffer (read once at the end), total energy
     counter (average power), throttle (violation) counters, and max memory clock / SM clock.
 
@@ -50,6 +52,18 @@ def cpu_busy_ticks(cpus: list[int]) -> dict[int, int]:
                     v = list(map(int, vals))
                     out[cpu] = sum(v) - v[3] - v[4]
     return out
+
+
+def cpu_steal_ticks(cpus: list[int]) -> int:
+    """Steal jiffies (time the hypervisor ran another guest on our vCPU), summed over the given CPUs."""
+    total = 0
+    with open("/proc/stat") as f:
+        for line in f:
+            if line.startswith("cpu") and line[3].isdigit():
+                name, *vals = line.split()
+                if int(name[3:]) in cpus and len(vals) > 7:
+                    total += int(vals[7])
+    return total
 
 
 def run_delay_ns(cpus: list[int]) -> int:
@@ -141,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
 
     hz = os.sysconf("SC_CLK_TCK")
     gpu = Gpu(a.gpu) if pynvml is not None and a.gpu is not None else None
-    busy0, irq0, delay0 = cpu_busy_ticks(cpus), interrupts(cpus), run_delay_ns(cpus)
+    busy0, irq0, delay0, steal0 = cpu_busy_ticks(cpus), interrupts(cpus), run_delay_ns(cpus), cpu_steal_ticks(cpus)
     ru0 = resource.getrusage(resource.RUSAGE_CHILDREN)
     t0 = time.monotonic()
 
@@ -149,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
 
     elapsed = time.monotonic() - t0
     ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
-    busy1, irq1, delay1 = cpu_busy_ticks(cpus), interrupts(cpus), run_delay_ns(cpus)
+    busy1, irq1, delay1, steal1 = cpu_busy_ticks(cpus), interrupts(cpus), run_delay_ns(cpus), cpu_steal_ticks(cpus)
 
     busy_s = sum(busy1[c] - busy0[c] for c in cpus) / hz
     own_s = (ru1.ru_utime - ru0.ru_utime) + (ru1.ru_stime - ru0.ru_stime)
@@ -165,6 +179,8 @@ def main(argv: list[str] | None = None) -> int:
             # Busy time on our CPUs that the command did not account for (other tasks, IRQs).
             # Approximate: the command may also run briefly on other CPUs (e.g. NVML threads).
             "foreign_cpu_s": max(0.0, busy_s - own_s),
+            # Part of the above the hypervisor gave to other guests (shared VM).
+            "steal_s_on_cpus": (steal1 - steal0) / hz,
             "voluntary_ctx_switches": ru1.ru_nvcsw - ru0.ru_nvcsw,
             "involuntary_ctx_switches": ru1.ru_nivcsw - ru0.ru_nivcsw,
             # Time tasks were ready to run on our CPUs but had to wait (includes the command's own
