@@ -26,8 +26,8 @@ Environment:
                 (GPUS defaults to "0,1 4,5" for TP=2, "0,1,2,3 4,5,6,7" for TP=4), NCORES cores per rank
   NCCL_ENV="NCCL_CUMEM_HOST_ENABLE=0"   for TP > 1, see `tperf baselines p2p`
   PUBLISH_REPO  publish every run to this dataset (rows tagged ab_id / ab_side / ab_round)
-  DASHBOARD_SPACE  Space rebuilt after publishing (default: [hub] dashboard_space in tperf.toml,
-                "" to skip)
+  DASHBOARD_SPACE  old static Space to rebuild after publishing (default: [hub] dashboard_space in tperf.toml,
+                none: results are browsed at transformers-ci /benchmarks)
 
 Layout on the host, under /opt/bench/ab/<id>/: base/ and head/ (worktrees of the two commits), src/tperf (this
 repository's package, with HARNESS_PATCHES applied: its harness drives both sides), src-head/tperf (head's copy, with

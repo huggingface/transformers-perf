@@ -44,7 +44,7 @@ REPO_URL = "https://github.com/huggingface/transformers.git"
 LOCK = "/tmp/bench-daily.lock"
 # Set by tperf deploy from tperf.toml, in /opt/bench/tperf.env (EnvironmentFile of the service)
 PUBLISH_REPO = os.environ.get("PUBLISH_REPO") or "hf-internal-testing/transformers-perf"
-DASHBOARD_SPACE = os.environ.get("DASHBOARD_SPACE", "hf-internal-testing/transformers-perf-dashboard")
+DASHBOARD_SPACE = os.environ.get("DASHBOARD_SPACE", "")  # off: results are browsed at transformers-ci /benchmarks
 RUNS = int(os.environ.get("RUNS") or 3)
 MAIN_SHA = os.environ.get("MAIN_SHA", "")  # commit to benchmark instead of the latest main
 ARGS = os.environ.get("ARGS", "")  # tperf.harness.run_benchmarks arguments replacing the suites' own
