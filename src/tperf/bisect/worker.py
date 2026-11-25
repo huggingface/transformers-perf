@@ -13,14 +13,23 @@ The dashboard never reaches the bench host: this worker polls it. Each loop:
 
 A job is the same thing as `tperf bisect` run by hand (tperf.bisect.run.run_job), so it reaches the bench host the
 same way: over ssh to HOST. On the bench host itself, set HOST=<user>@localhost. Every A/B takes the daily run's lock
-for its runs; the worker also claims nothing while the lock is held or the daily run is due (QUIET_UTC), so a job does
-not start just before 03:00 and lose its steps to the lock.
+for its runs; the worker claims nothing while the lock is held.
+
+The box's daily benchmark goes through the worker too when DAILY_AT_UTC is set (`tperf deploy --bisect-worker` sets it
+and turns bench-daily.timer off): once that time has passed on a day it has not run yet, the worker runs
+tperf.daily.main before claiming anything else (after the job in progress, if any), registers it on the dashboard
+(POST <API>/benchmarks/bisect/daily) and reports each of its stages. The daily run does not depend on the dashboard:
+when it cannot be reached, the run happens unreported.
 
 Environment:
   BISECT_API          dashboard base URL (default: https://transformers-ci.huggingface.cool)
   BISECT_TOKEN_FILE   file holding the worker's service token (or BISECT_TOKEN)
   POLL                seconds between polls when idle (default: 60)
-  QUIET_UTC           UTC hours in which no job is claimed, "<from>-<to>" (default: 1-5, around the 03:00 daily run)
+  QUIET_UTC           UTC hours in which no job is claimed, "<from>-<to>" (default: 1-5 when the timer runs the daily
+                      benchmark, none when this worker does)
+  DAILY_AT_UTC        "HH:MM": run the box's daily benchmark from this time each day (unset: bench-daily.timer does)
+  DAILY_STATE         file holding the date of the last daily run started here (default: daily-last)
+  BISECT_BOX          this box's name, for the logs (the dashboard knows the box from the token)
   GPUS                the two GPUs of each A/B (default "1 5": not the daily suites' GPUs 0 and 4)
 """
 
@@ -29,6 +38,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -72,10 +83,63 @@ def call(method: str, path: str, body: dict | None = None) -> tuple[int, dict | 
 
 def quiet_now(spec: str | None = None, now: datetime | None = None) -> bool:
     """True inside the QUIET_UTC window ("1-5": from 01:00 to 04:59 UTC; "22-2" wraps midnight)."""
-    start, _, end = (spec or os.environ.get("QUIET_UTC") or "1-5").partition("-")
+    if spec is None:
+        spec = os.environ.get("QUIET_UTC", "" if os.environ.get("DAILY_AT_UTC") else "1-5")
+    if not spec:
+        return False
+    start, _, end = spec.partition("-")
     hour = (now or datetime.now(UTC)).hour
     lo, hi = int(start), int(end or start)
     return lo <= hour < hi if lo <= hi else hour >= lo or hour < hi
+
+
+def daily_due(now: datetime | None = None) -> bool:
+    """The daily benchmark is due: DAILY_AT_UTC has passed today and it has not started today. Without a state file
+    (a fresh install) today counts as done, so installing the worker mid-day does not start a second daily run."""
+    at = os.environ.get("DAILY_AT_UTC", "")
+    if not at:
+        return False
+    now = now or datetime.now(UTC)
+    state = os.environ.get("DAILY_STATE") or "daily-last"
+    try:
+        with open(state) as f:
+            last = f.read().strip()
+    except FileNotFoundError:
+        with open(state, "w") as f:
+            f.write(now.date().isoformat())
+        return False
+    hour, _, minute = at.partition(":")
+    return now.date().isoformat() != last and (now.hour, now.minute) >= (int(hour), int(minute or 0))
+
+
+def run_daily() -> int:
+    """Run tperf.daily.main here, registered on the dashboard as a job of kind "daily" with one step per stage."""
+    with open(os.environ.get("DAILY_STATE") or "daily-last", "w") as f:
+        f.write(datetime.now(UTC).date().isoformat())  # first: a crash must not start it again in a loop
+    log("Daily benchmark")
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "tperf.daily.main"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
+    job_id, commit = None, ""
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        if found := re.match(r"stages (\d+)\s*$", line):
+            try:
+                status, body = call("POST", "/benchmarks/bisect/daily", {"total": int(found[1])})
+                job_id = str(body["id"]) if status == 201 and body else None
+            except OSError as e:
+                log(f"could not register the daily run: {e}")
+        elif found := re.match(r"stage (ok|failed): (.+?)\s*$", line):
+            if job_id:
+                report(job_id, {"kind": "step", "step": {"label": found[2], "verdict": found[1]}})
+        elif found := re.search(r"\bmain ([0-9a-f]{10}): ", line):
+            commit = found[1]
+    rc = proc.wait()
+    if job_id:
+        result = {"state": "done", "commit": commit} if rc == 0 else {
+            "state": "failed", "commit": commit, "reason": f"tperf.daily.main exited {rc} (see journalctl on the box)"}  # fmt: skip
+        report(job_id, {"kind": "done", "result": result})
+    return rc
 
 
 def report(job_id: str, body: dict) -> None:
@@ -91,13 +155,19 @@ def report(job_id: str, body: dict) -> None:
         time.sleep(10 * (attempt + 1))
 
 
+NO_CHANGE_WITHIN = 1.0  # %: a 95% CI inside ±this, around zero, says nothing moved; a wider one cannot tell
+
+
 def verdict(change: float, ci: tuple[float, float]) -> str:
-    """Head vs base, positive = slower (the metrics are latencies)."""
+    """Head vs base, positive = slower (the metrics are latencies). A CI that covers zero is "no significant change"
+    only when it is tight; otherwise the run was too noisy to tell, and says how noisy."""
     if ci[0] > 0:
         return "slower"
     if ci[1] < 0:
         return "faster"
-    return "no significant change"
+    if max(-ci[0], ci[1]) <= NO_CHANGE_WITHIN:
+        return "no significant change"
+    return f"inconclusive (±{(ci[1] - ci[0]) / 2:.1f}%)"
 
 
 def run_pr(job: dict) -> None:
@@ -226,7 +296,8 @@ def main(argv: list[str] | None = None) -> int:
     token()  # fail now, not at the first job
     while True:
         try:
-            ran = poll_once()
+            ran = daily_due() and run_daily() is not None
+            ran = ran or poll_once()
         except OSError as e:
             log(f"poll failed: {e}")
             ran = False

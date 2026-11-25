@@ -57,3 +57,11 @@ def test_bench_explains_refusals(monkeypatch, capsys):
     monkeypatch.setattr(bench, "request", request)
     assert bench.main(["123"]) == 1
     assert "already has a bench" in capsys.readouterr().err
+
+
+def test_bench_on_another_box(monkeypatch):
+    monkeypatch.setattr(bench, "access_token", lambda: "tok")
+    calls = []
+    monkeypatch.setattr(bench, "request", lambda path, body=None, token=None: calls.append(body) or {"url": "/x"})
+    assert bench.main(["123", "--box", "small", "--no-wait"]) == 0
+    assert calls == [{"pr": 123, "box": "small"}]

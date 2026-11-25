@@ -130,6 +130,63 @@ def test_pr_bench_runs_each_scenario_against_the_merge_base(monkeypatch):
 
 
 @pytest.mark.parametrize(("ci", "expected"), [((1.0, 2.0), "slower"), ((-2.0, -1.0), "faster"),
-                                               ((-1.0, 1.0), "no significant change")])  # fmt: skip
+                                               ((-0.8, 0.9), "no significant change"),
+                                               ((-3.32, 8.57), "inconclusive (±5.9%)")])  # fmt: skip
 def test_pr_verdict(ci, expected):
     assert worker.verdict(sum(ci) / 2, ci) == expected
+
+
+def test_daily_due_once_a_day_after_its_time_and_not_on_a_fresh_install(tmp_path, monkeypatch):
+    state = tmp_path / "daily-last"
+    monkeypatch.setenv("DAILY_STATE", str(state))
+    at = lambda h, m=0, d=26: datetime(2026, 11, d, h, m, tzinfo=UTC)
+    monkeypatch.delenv("DAILY_AT_UTC", raising=False)
+    assert worker.daily_due(at(4)) is False  # the timer runs it
+    monkeypatch.setenv("DAILY_AT_UTC", "03:00")
+    assert (
+        worker.daily_due(at(19)) is False and state.read_text() == "2026-11-26"
+    )  # fresh install: today counts as done
+    assert worker.daily_due(at(2, 59, 27)) is False
+    assert worker.daily_due(at(3, 0, 27)) is True
+    state.write_text("2026-11-27")
+    assert worker.daily_due(at(23, 0, 27)) is False
+
+
+def test_the_daily_run_is_registered_and_reports_each_stage(tmp_path, monkeypatch):
+    import io
+
+    monkeypatch.setenv("DAILY_STATE", str(tmp_path / "daily-last"))
+    out = io.StringIO("2026-11-27T03:00:01Z main 0123456789: Fix things\nstages 3\nstage ok: GPU suites, run 1/3\n"
+                      "noise\nstage failed: processors, run 1/3\n")  # fmt: skip
+
+    class Proc:
+        stdout = out
+
+        def wait(self):
+            return 1
+
+    monkeypatch.setattr(worker.subprocess, "Popen", lambda *a, **kw: Proc())
+    posted = []
+
+    def call(method, path, body=None):
+        posted.append((path, body))
+        return (201, {"id": "d1"}) if path.endswith("/daily") else (200, {})
+
+    monkeypatch.setattr(worker, "call", call)
+    assert worker.run_daily() == 1
+    assert posted[0] == ("/benchmarks/bisect/daily", {"total": 3})
+    steps = [b["step"] for p, b in posted if b.get("kind") == "step"]
+    assert steps == [
+        {"label": "GPU suites, run 1/3", "verdict": "ok"},
+        {"label": "processors, run 1/3", "verdict": "failed"},
+    ]
+    assert posted[-1][1]["result"]["state"] == "failed" and posted[-1][1]["result"]["commit"] == "0123456789"
+    assert (tmp_path / "daily-last").read_text() == datetime.now(UTC).date().isoformat()
+
+
+def test_no_quiet_window_when_the_worker_runs_the_daily(monkeypatch):
+    monkeypatch.delenv("QUIET_UTC", raising=False)
+    monkeypatch.setenv("DAILY_AT_UTC", "03:00")
+    assert worker.quiet_now(None, datetime(2026, 11, 26, 3, 30, tzinfo=UTC)) is False
+    monkeypatch.delenv("DAILY_AT_UTC")
+    assert worker.quiet_now(None, datetime(2026, 11, 26, 3, 30, tzinfo=UTC)) is True

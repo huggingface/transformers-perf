@@ -206,6 +206,7 @@ def main_series(rows: list[dict]) -> list[dict]:
                 "model": first["model_id"],
                 "scenario": scenario_label(first),
                 "gpu": f"{first.get('gpu_name')} #{first.get('gpu_index')}",
+                "instance_type": first.get("instance_type"),  # which bench box ran it (the dashboard's box list)
                 "points": points,
                 "bisect": bisect_job(srows[-1]),
             }

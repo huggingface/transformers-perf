@@ -1,11 +1,12 @@
 """Benchmark a transformers PR against main on the bench host, from anywhere: tperf bench <PR>.
 
-Usage: tperf bench <PR> [--no-wait]
+Usage: tperf bench <PR> [--box NAME] [--no-wait]
 
 Queues a PR bench on the dashboard (sign in first: tperf auth login). The bench host's worker runs `tperf ab` of the
 PR's head against its merge-base with main on the daily scenarios, one at a time; this command prints each scenario's
 result as it lands and the results page when the bench ends. --no-wait prints the page and returns at once.
-The run is posted in #transformers-benchmark too.
+--box runs it on another bench box than the default (the dashboard's Bench queue lists them). The run is posted in
+#transformers-benchmark too.
 """
 
 import argparse
@@ -28,17 +29,21 @@ def line(step: dict) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("pr", type=int, help="transformers PR number")
+    parser.add_argument("--box", default="", help="bench box name (default: the dashboard's default box)")
     parser.add_argument("--no-wait", action="store_true", help="queue it and print the results page")
     args = parser.parse_args(argv)
     try:
         token = access_token()
-        job = request("/benchmarks/pr-bench", body={"pr": args.pr}, token=token)
+        job = request(
+            "/benchmarks/pr-bench", body={"pr": args.pr, **({"box": args.box} if args.box else {})}, token=token
+        )
     except DashboardError as e:
         hints = {"pr_already_queued": "this PR already has a bench queued or running",
                  "bisect_queue_full": "the bench queue is full (3 jobs): try again later",
                  "pr_not_open": "the PR is not open", "pr_not_found": "no such PR in huggingface/transformers",
                  "unauthorized": "the session expired: run tperf auth login",
-                 "account_not_allowed": "PR benches are for Hugging Face organization members"}  # fmt: skip
+                 "account_not_allowed": "PR benches are for Hugging Face organization members",
+                 "unknown_box": f"no bench box named {args.box!r} (see the dashboard's Bench queue)"}  # fmt: skip
         print(f"tperf bench: {hints.get(e.error, e.error)}", file=sys.stderr)
         return 1
     except ValueError as e:

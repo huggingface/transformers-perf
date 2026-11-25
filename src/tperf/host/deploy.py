@@ -3,7 +3,8 @@ benchmark on the host.
 
 Usage: tperf deploy            # copy tooling, install bench-daily.timer (03:00 UTC)
        tperf deploy --run-now  # same, then start a run immediately (in the background)
-       tperf deploy --bisect-worker  # same, plus bench-bisect-worker.service (`tperf bisect worker`)
+       tperf deploy --bisect-worker [--box NAME]  # same, plus bench-bisect-worker.service (`tperf bisect worker`),
+                                                  # which then also runs the daily benchmark (the timer is turned off)
 
 On the host: the tperf package in /opt/bench/src/tperf (run with PYTHONPATH=/opt/bench/src), with the harness in
 /opt/bench/src/tperf/harness (its version in VERSION there), the scenarios in /opt/bench/daily/scenarios. Only this
@@ -46,7 +47,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--bisect-worker",
         action="store_true",
-        help="also run `tperf bisect worker` as a service (needs ~/.config/tperf/bisect-token on the host)",
+        help="also run `tperf bisect worker` as a service (needs ~/.config/tperf/bisect-token on the host); it runs the "
+        "daily benchmark too, at 03:00 UTC, through the dashboard's bench queue",
+    )
+    parser.add_argument(
+        "--box", default="", help="this box's name in the dashboard's box list (for the worker's logs)"
     )
     args = parser.parse_args(argv)
 
@@ -64,20 +69,28 @@ def main(argv: list[str] | None = None) -> None:
     scp_to(sorted((ROOT / "scenarios").glob("*.jsonl")), "/opt/bench/daily/scenarios/")
     units = PKG_SRC / "tperf/daily"
     scp_to([units / "bench-daily.service", units / "bench-daily.timer"], "/tmp/")
+    # Where the worker runs the daily benchmark, the timer stays off (a plain redeploy must not turn it back on)
+    worker_owns_daily = (
+        args.bisect_worker
+        or ssh("systemctl is-enabled --quiet bench-bisect-worker.service", check=False).returncode == 0
+    )
+    timer = "disable --now" if worker_owns_daily else "enable --now"
     ssh(
         "sudo install -m 644 /tmp/bench-daily.service /tmp/bench-daily.timer /etc/systemd/system/ "
         "&& rm /tmp/bench-daily.service /tmp/bench-daily.timer "
-        "&& sudo systemctl daemon-reload && sudo systemctl enable --now bench-daily.timer >/dev/null "
-        "&& systemctl list-timers bench-daily.timer --no-pager | head -2"
+        f"&& sudo systemctl daemon-reload && sudo systemctl {timer} bench-daily.timer >/dev/null 2>&1; "
+        "systemctl list-timers bench-daily.timer --no-pager | head -2"
     )
+    if worker_owns_daily:
+        print("daily benchmark: run by bench-bisect-worker (bench-daily.timer off)")
     if args.bisect_worker:
-        install_bisect_worker()
+        install_bisect_worker(args.box)
     if args.run_now:
         ssh(["sudo", "systemctl", "start", "--no-block", "bench-daily.service"])
         print(f"started: ssh {HOST} journalctl -u bench-daily -f")
 
 
-def install_bisect_worker() -> None:
+def install_bisect_worker(box: str = "") -> None:
     """bench-bisect-worker.service, and the ssh key it uses to reach this host as HOST=ubuntu@localhost."""
     ssh("test -s ~/.config/tperf/bisect-token || { echo 'missing ~/.config/tperf/bisect-token' >&2; exit 1; }")
     ssh(
@@ -90,6 +103,13 @@ def install_bisect_worker() -> None:
         "&& chmod 600 ~/.ssh/config && ssh -o BatchMode=yes localhost true"
     )
     scp_to([PKG_SRC / "tperf/bisect/bench-bisect-worker.service"], "/tmp/")
+    # this box's settings, beside the packaged unit: its name, and the daily run's time
+    dropin = f"[Service]\nEnvironment=DAILY_AT_UTC=03:00\nEnvironment=BISECT_BOX={box or 'default'}\n"
+    subprocess.run(
+        [*SSH, require_host(), ("sudo mkdir -p /etc/systemd/system/bench-bisect-worker.service.d "
+                                "&& sudo tee /etc/systemd/system/bench-bisect-worker.service.d/box.conf >/dev/null")],
+        input=dropin, text=True, check=True,
+    )  # fmt: skip
     ssh(
         "sudo install -m 644 /tmp/bench-bisect-worker.service /etc/systemd/system/ "
         "&& rm /tmp/bench-bisect-worker.service "

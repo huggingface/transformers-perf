@@ -20,6 +20,8 @@ Then, once nothing timed runs any more, one memory profile per GPU suite (tperf.
 shapes and first scenario, every allocation recorded), published to memory/<month>/<group>/ in the dataset and linked
 from the dashboard's daily points. MEMORY_PROFILE=0 skips it; a failed profile is logged and fails nothing.
 Skipped (exit 0) if a benchmark is already running on the host.
+Progress, for `tperf bisect worker` (which starts this run at 03:00 UTC and shows it in the dashboard's Bench queue):
+a line "stages <n>" once the stages are known, then "stage <ok|failed>: <label>" as each one ends.
 
 To try other settings the same way (e.g. a shorter run), without touching the daily series:
   MAIN_SHA=<commit> ARGS="-w 5 -i 10 -b 1 -s 128 -n 64" LABEL_PREFIX=check DASHBOARD_SPACE= \\
@@ -138,6 +140,9 @@ class Daily:
         self.sha = ""
         self.harness_version = ""
 
+    def stage(self, label: str, ok: bool) -> None:
+        print(f"stage {'ok' if ok else 'failed'}: {label}", flush=True)
+
     def start_suite(self, s: str, i: int) -> tuple[subprocess.Popen | None, str]:
         """Write the manifest and launch one run of a suite; returns its process (None if the manifest failed)."""
         gpu, model, args, scen = SUITES[s]
@@ -189,11 +194,13 @@ class Daily:
             tune_host()
             # Manifests first, then all suites at once, so no manifest is taken while another suite runs
             started = [(s, *self.start_suite(s, i)) for s in suites]
+            run_ok = True
             for s, proc, cc in started:
                 if proc is None or proc.wait():
                     log(f"error: {s} run {i} failed, see {self.out}/{s}/run{i}/run.log")
-                    ok = False
+                    ok = run_ok = False
                 shutil.rmtree(cc, ignore_errors=True)
+            self.stage(f"GPU suites ({', '.join(suites)}), run {i}/{RUNS}", run_ok)
         return ok
 
     def run_memory_profiles(self, suites: list[str]) -> None:
@@ -270,7 +277,9 @@ class Daily:
                 ).returncode  # fmt: skip
             if rc or not (d / "serve" / "results.json").exists():
                 log(f"error: {s} run {i} failed, see {d}/run.log")
+                self.stage(f"{s}, run {i}/{RUNS}", False)
                 return False
+            self.stage(f"{s}, run {i}/{RUNS}", True)
             runs.append(d)
         return last_line([*module("common.record"), "publish", *runs, "--repo", PUBLISH_REPO], f"{s}: ")
 
@@ -304,6 +313,7 @@ for m in {{s['model'] for s in scenarios if s.get('stage', 'processor') != 'proc
                      "--scenarios", scen, "--output-dir", d, "--threads", NCORES),
                     cwd="/tmp", env=run_env, stdout=logf, stderr=subprocess.STDOUT,
                 ).returncode  # fmt: skip
+            self.stage(f"processors, run {i}/{RUNS}", not rc)
             if rc:
                 log(f"error: processors run {i} failed, see {d}/run.log")
                 return False
@@ -334,6 +344,9 @@ for m in {{s['model'] for s in scenarios if s.get('stage', 'processor') != 'proc
         for model in dict.fromkeys([*(SUITES[s][1] for s in gpu_suites), *(SERVE_SUITES[s][1] for s in serve_suites)]):
             subprocess.run(["/opt/bench/tbv2-venv/bin/hf", "download", model], check=True, stdout=subprocess.DEVNULL)
 
+        stages = (RUNS if gpu_suites else 0) + RUNS * len(serve_suites) + (RUNS if "processors" in suites else 0)
+        stages += 1 + (1 if MEMORY_PROFILE and gpu_suites else 0)  # publishing, memory profiles
+        print(f"stages {stages}", flush=True)
         ok = self.run_gpu_suites(gpu_suites) if gpu_suites else True
         for s in serve_suites:
             if not self.run_serve(s):
@@ -342,14 +355,17 @@ for m in {{s['model'] for s in scenarios if s.get('stage', 'processor') != 'proc
         if "processors" in suites and not self.run_processors():
             log("error: processors failed")
             ok = False
+        published = True
         for s in gpu_suites:
             runs = sorted((self.out / s).glob("run*"))
             if not last_line([*module("common.record"), "publish", *runs, "--repo", PUBLISH_REPO], f"{s}: "):
                 log(f"error: publishing {s} failed")
-                ok = False
+                ok = published = False
+        self.stage("publish to the dataset", published)
         if MEMORY_PROFILE and gpu_suites:
             log("memory profiles")
             self.run_memory_profiles(gpu_suites)
+            self.stage("memory profiles", True)
         if DASHBOARD_SPACE:
             dash = [*module("dashboard.build"), "--dataset", PUBLISH_REPO,
                     "--out", D / "dashboard", "--publish", DASHBOARD_SPACE]  # fmt: skip

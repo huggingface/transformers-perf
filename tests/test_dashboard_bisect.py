@@ -35,7 +35,7 @@ def test_what_the_bisect_cannot_rerun():
 def serve_row(day: str, ttft: float, run: int) -> dict:
     return {"label": "daily-serve-gemma3-1b", "source": "main", "series_key": "serve-key", "group_id": f"{day}-serve",
             "started_at": f"{day}T03:{run:02d}:00", "success": True, "commit_id": "c" * 40, "model_id": "google/gemma-3-1b-it",
-            "gpu_name": "NVIDIA A10G", "gpu_index": 4, "scenario": "serve:chat", "n_samples": 24,
+            "gpu_name": "NVIDIA A10G", "gpu_index": 4, "instance_type": "g5.48xlarge", "scenario": "serve:chat", "n_samples": 24,
             "num_tokens_to_generate": 64, "compile_mode": None, "continuous_batching": False,
             "ttft_ms_median": ttft, "e2e_ms_median": 900.0, "bench_args": "serve chat"}  # fmt: skip
 
@@ -46,6 +46,7 @@ def test_daily_serve_runs_are_a_serve_series_that_cannot_be_bisected():
     rows = [serve_row("2026-11-26", 30.0 + i, i) for i in range(3)]
     (series,) = main_series(rows)
     assert series["group"] == "Serve" and series["bisect"] is None
+    assert series["instance_type"] == "g5.48xlarge"
     assert series["scenario"].startswith("transformers serve, chat")
     assert series["points"][0]["values"]["ttft"][0] == 31.0 and series["points"][0]["runs"] == 3
 
