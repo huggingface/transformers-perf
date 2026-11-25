@@ -11,6 +11,9 @@ Manual run: PYTHONPATH=/opt/bench/src /usr/bin/python3 -m tperf.daily.main [suit
 Each suite runs RUNS times on its own GPU; suites on GPUs of different NUMA nodes run in parallel
 (they share no cores, memory or PCIe). Per run: host tuning re-applied (once for all suites),
 manifest, noise probe, fresh compile caches. Rows are published with source=main, label daily-<suite>.
+Then the serve suites (SERVE_SUITES): tperf.serve.bench, a multi-turn chat on `transformers serve` from the worktree of
+main (scenarios/serve-multiturn.jsonl), RUNS times on the suite's GPU once the GPU suites are done (the server shares
+the node's cores), published with label daily-<suite> like the GPU suites.
 Then the "processors" suite: tperf.processors.bench on scenarios/processors.jsonl, RUNS times, pinned to NCORES cores of
 node 0 and GPU 0 (free once the GPU suites are done), published to processors/ with label daily-processors.
 Then, once nothing timed runs any more, one memory profile per GPU suite (tperf.memory.profile: the suite's model,
@@ -25,6 +28,7 @@ To try other settings the same way (e.g. a shorter run), without touching the da
 
 import argparse
 import fcntl
+import json
 import os
 import shlex
 import shutil
@@ -63,6 +67,11 @@ SUITES = {
         "-w 5 -i 6 -b 1 -s 448 -n 128",
         D / "scenarios/sliding-window.jsonl",
     ),
+}
+
+# serve suite name -> (gpu, model, scenario name in scenarios/serve-multiturn.jsonl)
+SERVE_SUITES = {
+    "serve-gemma3-1b": (4, "google/gemma-3-1b-it", "chat"),
 }
 
 os.environ.update(
@@ -219,6 +228,52 @@ class Daily:
             if not last_line([*module("memory.publish"), d, "--repo", PUBLISH_REPO, "--group", group], f"{s}: "):
                 log(f"warning: publishing the memory profile of {s} failed")
 
+    def run_serve(self, s: str) -> bool:
+        """All runs of one serve suite (tperf.serve.bench on the worktree of main), then publish them."""
+        gpu, model, name = SERVE_SUITES[s]
+        node = GPU_NUMA_MAP[gpu]
+        cpus = cpus_for(node)
+        scen = D / "scenarios/serve-multiturn.jsonl"
+        names = [json.loads(line).get("name") for line in scen.read_text().splitlines() if line.startswith("{")]
+        if name not in names:
+            log(f"error: no serve scenario {name!r} in {scen}")
+            return False
+        runs = []
+        for i in range(1, RUNS + 1):
+            log(f"{s} run {i}/{RUNS}")
+            tune_host()
+            d = self.out / s / f"run{i}"
+            d.mkdir(parents=True, exist_ok=True)
+            env = dict(
+                os.environ, PYTHONPATH=f"{SRC}:{self.w}/src", TRANSFORMERS_DIR=self.w, BENCH_SOURCE="main",
+                BENCH_PR="", BENCH_BRANCH="main", BENCH_HARNESS=self.harness_version, HF_HUB_OFFLINE="1",
+                OMP_NUM_THREADS=str(NCORES),
+            )  # fmt: skip
+            with open(d / "run.log", "w") as logf:
+                io = dict(cwd=d, env=env, stdout=logf, stderr=subprocess.STDOUT)
+                manifest = subprocess.run(
+                    argv(*module("common.record"), "manifest", "--out", d / "manifest.json", "--gpu", gpu,
+                     "--cpus", cpus, "--numa-node", node, "--model", model, "--bench-args", f"serve {name}",
+                     "--group", f"{self.stamp}-{LABEL_PREFIX}-{s}", "--run", i, "--label", f"{LABEL_PREFIX}-{s}"),
+                    **io,
+                )  # fmt: skip
+                if manifest.returncode:
+                    log(f"error: {s} run {i} manifest failed, see {d}/run.log")
+                    return False
+                io["env"] = dict(env, CUDA_VISIBLE_DEVICES=str(gpu))
+                rc = subprocess.run(
+                    argv("numactl", f"--physcpubind={cpus}", f"--membind={node}",
+                     *module("common.noise_probe"), "--cpus", cpus, "--gpu", gpu, "--out", d / "probe.json", "--",
+                     *module("serve.bench"), "--model-id", model, "--out", d / "serve", "--python", PY,
+                     "--commit", self.sha, "--config-file", scen, "--scenario-index", names.index(name)),
+                    **io,
+                ).returncode  # fmt: skip
+            if rc or not (d / "serve" / "results.json").exists():
+                log(f"error: {s} run {i} failed, see {d}/run.log")
+                return False
+            runs.append(d)
+        return last_line([*module("common.record"), "publish", *runs, "--repo", PUBLISH_REPO], f"{s}: ")
+
     def run_processors(self) -> bool:
         """All runs of the processors suite, then publish them as one group."""
         cpus = cpus_for(0)
@@ -261,7 +316,8 @@ for m in {{s['model'] for s in scenarios if s.get('stage', 'processor') != 'proc
         )  # fmt: skip
 
     def run(self, suites: list[str]) -> int:
-        gpu_suites = [s for s in suites if s != "processors"]
+        gpu_suites = [s for s in suites if s in SUITES]
+        serve_suites = [s for s in suites if s in SERVE_SUITES]
         self.out.mkdir(parents=True, exist_ok=True)
 
         # --- Latest main ---
@@ -275,12 +331,14 @@ for m in {{s['model'] for s in scenarios if s.get('stage', 'processor') != 'proc
         self.harness_version = HARNESS_VERSION.read_text().strip()
         log(f"harness {self.harness_version}")
 
-        for s in gpu_suites:
-            subprocess.run(
-                ["/opt/bench/tbv2-venv/bin/hf", "download", SUITES[s][1]], check=True, stdout=subprocess.DEVNULL
-            )
+        for model in dict.fromkeys([*(SUITES[s][1] for s in gpu_suites), *(SERVE_SUITES[s][1] for s in serve_suites)]):
+            subprocess.run(["/opt/bench/tbv2-venv/bin/hf", "download", model], check=True, stdout=subprocess.DEVNULL)
 
         ok = self.run_gpu_suites(gpu_suites) if gpu_suites else True
+        for s in serve_suites:
+            if not self.run_serve(s):
+                log(f"error: {s} failed")
+                ok = False
         if "processors" in suites and not self.run_processors():
             log("error: processors failed")
             ok = False
@@ -311,10 +369,10 @@ for m in {{s['model'] for s in scenarios if s.get('stage', 'processor') != 'proc
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("suites", nargs="*", help=f"default: {' '.join(SUITES)} processors")
+    p.add_argument("suites", nargs="*", help=f"default: {' '.join([*SUITES, *SERVE_SUITES])} processors")
     a = p.parse_args(argv)
-    suites = a.suites or [*SUITES, "processors"]
-    unknown = [s for s in suites if s != "processors" and s not in SUITES]
+    suites = a.suites or [*SUITES, *SERVE_SUITES, "processors"]
+    unknown = [s for s in suites if s != "processors" and s not in SUITES and s not in SERVE_SUITES]
     if unknown:
         p.error(f"unknown suite(s): {' '.join(unknown)}")
 

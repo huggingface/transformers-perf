@@ -30,3 +30,35 @@ def test_what_the_bisect_cannot_rerun():
     assert bisect_job(ROW | {"tp": 2}) is None
     assert bisect_job(ROW | {"scenario": "serve:multiturn"}) is None
     assert bisect_job(ROW | {"bench_args": None}) is None
+
+
+def serve_row(day: str, ttft: float, run: int) -> dict:
+    return {"label": "daily-serve-gemma3-1b", "source": "main", "series_key": "serve-key", "group_id": f"{day}-serve",
+            "started_at": f"{day}T03:{run:02d}:00", "success": True, "commit_id": "c" * 40, "model_id": "google/gemma-3-1b-it",
+            "gpu_name": "NVIDIA A10G", "gpu_index": 4, "scenario": "serve:chat", "n_samples": 24,
+            "num_tokens_to_generate": 64, "compile_mode": None, "continuous_batching": False,
+            "ttft_ms_median": ttft, "e2e_ms_median": 900.0, "bench_args": "serve chat"}  # fmt: skip
+
+
+def test_daily_serve_runs_are_a_serve_series_that_cannot_be_bisected():
+    from tperf.dashboard.build import main_series
+
+    rows = [serve_row("2026-11-26", 30.0 + i, i) for i in range(3)]
+    (series,) = main_series(rows)
+    assert series["group"] == "Serve" and series["bisect"] is None
+    assert series["scenario"].startswith("transformers serve, chat")
+    assert series["points"][0]["values"]["ttft"][0] == 31.0 and series["points"][0]["runs"] == 3
+
+
+def test_the_daily_serve_suite_names_a_scenario_that_exists(monkeypatch):
+    import importlib
+    import json
+    import os
+    from pathlib import Path
+
+    monkeypatch.setattr(os, "environ", dict(os.environ))  # the module sets the host's PYTHONPATH and HF_HOME
+    daily = importlib.import_module("tperf.daily.main")
+    names = [json.loads(line)["name"] for line in Path("scenarios/serve-multiturn.jsonl").read_text().splitlines()
+             if line.startswith("{")]  # fmt: skip
+    for gpu, model, name in daily.SERVE_SUITES.values():
+        assert name in names and gpu not in {g for g, *_ in daily.SUITES.values()} - {4}

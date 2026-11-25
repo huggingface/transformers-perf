@@ -200,7 +200,8 @@ def main_series(rows: list[dict]) -> list[dict]:
         series.append(
             {
                 "key": key,
-                "group": "Generation",
+                # the daily serve suite: a multi-turn chat on `transformers serve` (tperf.serve.bench)
+                "group": "Serve" if (first.get("scenario") or "").startswith("serve:") else "Generation",
                 "suite": first["label"].removeprefix("daily-"),
                 "model": first["model_id"],
                 "scenario": scenario_label(first),
