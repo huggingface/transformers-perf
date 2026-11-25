@@ -16,6 +16,7 @@ import argparse
 import html
 import json
 import pickle
+import re
 import subprocess
 import sys
 from collections import defaultdict
@@ -402,6 +403,45 @@ def esc(x: object) -> str:
     return html.escape(str(x))
 
 
+# A frame label is "<path>:<line> <function>" (an allocation site, a line py-spy sampled) or "<function> (<path>)" (a
+# function on the stack); <path> as short_path writes it. Frames of transformers and torch link to their source on
+# GitHub at the commit (transformers) or release tag (torch) the run used, so the links stay valid.
+LINE_LABEL = re.compile(r"(?P<path>(?:transformers|torch)/\S+\.py):(?P<line>\d+) .+")
+FUNCTION_LABEL = re.compile(r".+ \((?P<path>(?:transformers|torch)/\S+\.py)\)")
+
+
+def code_refs(profile: dict) -> dict[str, str]:
+    """The GitHub tree of each linkable source: {"transformers": its commit, "torch": its release tag}, when known."""
+    refs = {}
+    commit = str(profile.get("commit_id") or "")
+    if re.fullmatch(r"[0-9a-f]{40}", commit):  # a full hash only: a short one may stop resolving
+        refs["transformers"] = f"https://github.com/huggingface/transformers/blob/{commit}/src/"
+    torch = ((profile.get("versions") or {}).get("torch") or "").split("+")[0]
+    if re.fullmatch(r"\d+\.\d+\.\d+", torch):  # a release (a nightly has no tag)
+        refs["torch"] = f"https://github.com/pytorch/pytorch/blob/v{torch}/"
+    return refs
+
+
+def code_url(label: str, refs: dict[str, str]) -> str | None:
+    match = LINE_LABEL.fullmatch(label) or FUNCTION_LABEL.fullmatch(label)
+    if not match:
+        return None
+    path = match["path"]
+    base = refs.get(path.split("/", 1)[0])
+    if not base:
+        return None
+    line = match.groupdict().get("line")
+    return base + path + (f"#L{line}" if line else "")
+
+
+def code(label: str, refs: dict[str, str] | None = None) -> str:
+    """<code>label</code>, linked to its source on GitHub when it is a transformers or torch frame."""
+    url = code_url(label, refs or {})
+    if not url:
+        return f"<code>{esc(label)}</code>"
+    return f"<a href='{esc(url)}' target='_blank' rel='noopener'><code>{esc(label)}</code></a>"
+
+
 def fmt_mb(value: float | None, digits: int = 0) -> str:
     if value is None:
         return "–"
@@ -515,16 +555,16 @@ def bars(items: dict[str, float], total: float, colors: dict[str, str] | None = 
     return "".join(rows) or '<p class="muted">Nothing recorded.</p>'
 
 
-def sites_table(sites: list[dict], total: float, show_allocators: bool = False) -> str:
+def sites_table(sites: list[dict], total: float, show_allocators: bool = False, refs: dict | None = None) -> str:
     rows = []
     for s in sites[:TOP_SITES]:
-        stack = "\n".join(s["stack"])
+        stack = "\n".join(code(line, refs) for line in s["stack"])
         extra = f"<td>{esc(', '.join(s['allocators']))}</td>" if show_allocators else ""
         pct = s["bytes"] / total * 100 if total else 0
         rows.append(
             f"<tr><td class='num'>{esc(fmt_bytes(s['bytes']))}</td><td class='num'>{pct:.1f}%</td>"
             f"<td class='num'>{s['count']:,}</td><td>{esc(s['category'])}</td>{extra}"
-            f"<td><details><summary><code>{esc(s['site'])}</code></summary><pre>{esc(stack)}</pre></details></td></tr>"
+            f"<td><details><summary>{code(s['site'], refs)}</summary><pre>{stack}</pre></details></td></tr>"
         )
     more = f"<p class='muted'>{len(sites) - TOP_SITES} smaller sites not shown.</p>" if len(sites) > TOP_SITES else ""
     head = "<th>Allocator</th>" if show_allocators else ""
@@ -810,14 +850,14 @@ def time_bars(items: dict[str, float], total: float) -> str:
     return "".join(rows) or '<p class="muted">Nothing recorded.</p>'
 
 
-def functions_table(rows: list[dict], total: float, tokens: int | None, what: str) -> str:
+def functions_table(rows: list[dict], total: float, tokens: int | None, what: str, refs: dict | None = None) -> str:
     body = []
     for r in rows[:TOP_FUNCTIONS]:
         pct = r["seconds"] / total * 100 if total else 0
         per_token = f"{r['seconds'] / tokens * 1e3:,.3f}" if tokens else "–"
         body.append(f"<tr><td class='num'>{r['seconds']:,.3f} s</td><td class='num'>{pct:.1f}%</td>"
                     f"<td class='num'>{per_token}</td><td>{esc(r['area'])}</td>"
-                    f"<td><code>{esc(r['function'])}</code></td></tr>")  # fmt: skip
+                    f"<td>{code(r['function'], refs)}</td></tr>")  # fmt: skip
     return (
         "<div class='table-wrap'><table><thead><tr><th class='num'>Time</th><th class='num'>Share</th>"
         f"<th class='num'>ms / token</th><th>Area</th><th>{esc(what)}</th></tr></thead>"
@@ -864,9 +904,9 @@ def python_section(python: dict | None, links: dict) -> str:
             "<h3>By area of code (innermost frame)</h3>"
             + time_bars(g["by_area"], g["seconds"])
             + "<h3>Self: the lines the samples were in</h3>"
-            + functions_table(g["self"], g["seconds"], tokens, "Line")
+            + functions_table(g["self"], g["seconds"], tokens, "Line", links.get("code"))
             + "<h3>Inclusive: functions on the stack, and everything they called</h3>"
-            + functions_table(g["inclusive"], g["seconds"], tokens, "Function")
+            + functions_table(g["inclusive"], g["seconds"], tokens, "Function", links.get("code"))
             + "</details>"
         )
     if links.get("python_stacks"):
@@ -910,6 +950,7 @@ def render_body(profile: dict, gpu: dict | None, host: dict | None, links: dict,
 
     links: "flamegraph" and "memory_viz" (URLs, or absent), "time" (the time report, which then holds the python
     pass instead of this page), "files" ([(name, what)] listed at the end)."""
+    links = {**links, "code": code_refs(profile)}
     marks = profile.get("marks") or []
     weights = profile.get("weights") or {}
     load = profile.get("load_memory") or {}
@@ -996,7 +1037,7 @@ def render_body(profile: dict, gpu: dict | None, host: dict | None, links: dict,
         parts.append("<h3>At the peak, by category</h3><div class='card'>"
                      + bars(gpu["peak_by_category"], gpu["peak_bytes"], COLORS) + "</div>")  # fmt: skip
         parts.append("<h3>At the peak, by the code that allocated it</h3>"
-                     + sites_table(gpu["peak_sites"], gpu["peak_bytes"]))  # fmt: skip
+                     + sites_table(gpu["peak_sites"], gpu["peak_bytes"], refs=links["code"]))  # fmt: skip
 
     # Model tensors
     parts.append("<h2>Model tensors</h2>")
@@ -1041,9 +1082,9 @@ def render_body(profile: dict, gpu: dict | None, host: dict | None, links: dict,
             + (f"<p>Full flamegraph: <a href='{esc(flame)}' target='_blank' rel='noopener'>memray flamegraph</a>"
                f"{' (native frames included)' if host['native'] else ''}.</p>" if flame else "")
             + "<h3>Heap at the peak (malloc and friends), by the code that allocated it</h3>"
-            + sites_table(host["heap_sites"], host["peak_bytes"], show_allocators=True)
+            + sites_table(host["heap_sites"], host["peak_bytes"], show_allocators=True, refs=links["code"])
             + "<h3>Mapped at the peak (mmap: files, CUDA driver mappings)</h3>"
-            + sites_table(host["mmap_sites"], host["peak_bytes"], show_allocators=True)
+            + sites_table(host["mmap_sites"], host["peak_bytes"], show_allocators=True, refs=links["code"])
         )  # fmt: skip
 
     if not links.get("time"):
@@ -1073,6 +1114,7 @@ def render(profile: dict, gpu: dict | None, host: dict | None, links: dict, pyth
 def render_time_body(profile: dict, python: dict | None, links: dict) -> str:
     """The time report: the python pass of the profile run, with the same guarantees as render_body (no script, every
     value escaped). links: "memory" (the memory report), "python_stacks" (the folded stacks)."""
+    links = {**links, "code": code_refs(profile)}
     parts = [f"<div class='mem'><h1>{esc(time_title_of(profile))}</h1>", meta_line(profile)]
     if links.get("memory"):
         parts.append(f"<p>Where the memory went: <a href='{esc(links['memory'])}'>memory report</a>.</p>")

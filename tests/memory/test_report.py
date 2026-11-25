@@ -263,3 +263,36 @@ def test_build_reads_python_summary(tmp_path):
     assert "time.html" in html and "torch/x.py:1 f" not in html
     time = (tmp_path / "time.html").read_text()
     assert "torch/x.py:1 f" in time and "speedscope" in time and "report.html" in time
+
+
+def test_code_links_to_github_at_the_runs_commit():
+    from tperf.memory.report import code, code_refs
+
+    sha = "fa9c04ea60c5e1d2ecc38064442973fa1ddccc72"
+    refs = code_refs({"commit_id": sha, "versions": {"torch": "2.15.0+cu132"}})
+    line = code("transformers/generation/utils.py:395 StopCheck.__call__", refs)
+    assert f"https://github.com/huggingface/transformers/blob/{sha}/src/transformers/generation/utils.py#L395" in line
+    assert "pytorch/pytorch/blob/v2.15.0/torch/nn/modules/module.py#L1798" in code(
+        "torch/nn/modules/module.py:1798 Module._call_impl", refs
+    )
+    function = code("StopCheck.__call__ (transformers/generation/utils.py)", refs)
+    assert f"{sha}/src/transformers/generation/utils.py'" in function  # the file: no line for a function
+    # no link: other code, a short or missing commit, a nightly torch; the label is escaped either way
+    assert "href" not in code("kernels/layer/layer.py:10 f", refs) and "<a" not in code("f <x>", refs)
+    assert "&lt;x&gt;" in code("f <x>", refs)
+    assert code_refs({"commit_id": sha[:12], "versions": {"torch": "2.16.0.dev20261101"}}) == {}
+
+
+def test_reports_link_their_code():
+    from tperf.common.pystacks import parse_raw, summarize
+    from tperf.memory.profile import PHASE_FUNCTIONS
+    from tperf.memory.report import render_time_fragment
+
+    raw = (
+        "<module> (/r/src/tperf/memory/profile.py:1);_tperf_phase_generations (/r/src/tperf/memory/profile.py:2);"
+        f"generate ({TF}/generation/utils.py:2000);forward ({TF}/models/llama/modeling_llama.py:9) 70\n"
+    )
+    python = summarize(parse_raw(raw), rate=100, phases=PHASE_FUNCTIONS)
+    sha = "a" * 40
+    body = render_time_fragment({"model_id": "m", "commit_id": sha, "marks": []}, python, {})["body"]
+    assert f"/blob/{sha}/src/transformers/models/llama/modeling_llama.py#L9" in body and "<script" not in body
