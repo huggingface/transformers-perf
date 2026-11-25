@@ -91,7 +91,84 @@ def report(job_id: str, body: dict) -> None:
         time.sleep(10 * (attempt + 1))
 
 
+def verdict(change: float, ci: tuple[float, float]) -> str:
+    """Head vs base, positive = slower (the metrics are latencies)."""
+    if ci[0] > 0:
+        return "slower"
+    if ci[1] < 0:
+        return "faster"
+    return "no significant change"
+
+
+def run_pr(job: dict) -> None:
+    """A PR bench: `tperf ab` of the PR head against its merge-base with main, one step per daily scenario."""
+    from tperf.bisect.run import run_ab
+    from tperf.common.benchlib import REPO_URL, TF, ssh, ssh_out
+
+    job_id, pr, head = str(job["id"]), int(job["pr"]), str(job["head"])
+    log(f"Job {job_id}: PR #{pr} at {head[:10]}, {len(job['scenarios'])} scenarios")
+    git = ["git", "-C", TF]
+    ssh([*git, "fetch", "-q", REPO_URL, "+main:refs/ab/main", f"+refs/pull/{pr}/head:refs/ab/pr-{pr}"])
+    if ssh_out([*git, "rev-parse", f"refs/ab/pr-{pr}"]) != head:
+        log(f"PR #{pr} moved since it was queued; benching the queued head {head[:10]}")
+    base = ssh_out([*git, "merge-base", "refs/ab/main", head])
+    measured = 0
+    for sc in job["scenarios"]:
+        step = {"model": sc["model"], "scenario": sc["label"], "base": base, "head": head}
+        with scenario_env(sc):
+            m = run_ab(base, head, int(job.get("rounds") or 3), job.get("metric") or "e2e")
+        if m is None:
+            step.update(change=None, ci=None, verdict="failed to run")
+        else:
+            measured += 1
+            step.update(change=round(m.change, 2), ci=[round(c, 2) for c in m.ci], verdict=verdict(m.change, m.ci),
+                        base_ms=m.base, head_ms=m.head, ab_dir=m.ab_dir)  # fmt: skip
+        report(job_id, {"kind": "step", "step": step})
+    if measured:
+        report(job_id, {"kind": "done", "result": {"state": "done", "base": base}})
+    else:
+        report(
+            job_id, {"kind": "done", "result": {"state": "failed", "reason": "no scenario ran (see the worker log)"}}
+        )
+
+
+class scenario_env:
+    """MODEL, SCENARIOS (a one-line jsonl) and BENCH_ARGS for one scenario, restored afterwards."""
+
+    KEYS = ("MODEL", "SCENARIOS", "BENCH_ARGS")
+
+    def __init__(self, sc: dict):
+        self.sc = sc
+
+    def __enter__(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
+            f.write(json.dumps(self.sc["scenario"]) + "\n")
+            self.path = f.name
+        self.saved = {k: os.environ.get(k) for k in self.KEYS}
+        os.environ.update(MODEL=self.sc["model"], SCENARIOS=self.path)
+        if self.sc.get("bench_args"):
+            os.environ["BENCH_ARGS"] = self.sc["bench_args"]
+        else:
+            os.environ.pop("BENCH_ARGS", None)
+
+    def __exit__(self, *exc):
+        os.unlink(self.path)
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def run(job: dict) -> None:
+    if job.get("kind") == "pr":
+        try:
+            run_pr(job)
+        except (Exception, SystemExit) as e:  # noqa: BLE001 -- die() exits; a job must still end
+            reason = str(e) if isinstance(e, SystemExit) else f"{type(e).__name__}: {e}"
+            traceback.print_exc()
+            report(str(job["id"]), {"kind": "done", "result": {"state": "failed", "reason": reason or "failed"}})
+        return
     from tperf.bisect.run import run_job
 
     job_id = str(job["id"])

@@ -86,3 +86,48 @@ def test_no_claim_while_the_daily_run_holds_the_lock(monkeypatch):
     fake_api(monkeypatch, JOB)
     monkeypatch.setattr(worker, "daily_lock_free", lambda: False)
     assert worker.poll_once() is False
+
+
+PR_JOB = {"id": "abc", "kind": "pr", "pr": 123, "head": "e" * 40, "metric": "e2e", "rounds": 3,
+          "scenarios": [{"model": "google/gemma-3-1b-it", "label": "fa2", "scenario": {"attn_implementation": "flash_attention_2"},
+                         "bench_args": "-w 5"},
+                        {"model": "meta-llama/Llama-2-7b-hf", "label": "eager", "scenario": {"attn_implementation": "eager"},
+                         "bench_args": ""}]}  # fmt: skip
+
+
+def test_pr_bench_runs_each_scenario_against_the_merge_base(monkeypatch):
+    import os
+
+    from tperf.bisect import run as bisect_run
+    from tperf.bisect.run import Measurement
+    from tperf.common import benchlib
+
+    posted = fake_api(monkeypatch, PR_JOB)
+    remote = []
+    monkeypatch.setattr(benchlib, "ssh", lambda cmd, **kw: remote.append(cmd))
+    monkeypatch.setattr(benchlib, "ssh_out", lambda cmd: "e" * 40 if "rev-parse" in cmd else "m" * 40)
+    seen = []
+
+    def run_ab(base, head, rounds, metric):
+        seen.append((base, head, rounds, os.environ["MODEL"], os.environ.get("BENCH_ARGS")))
+        if os.environ["MODEL"].startswith("meta"):
+            return None
+        return Measurement(-3.0, (-4.0, -2.0), 100.0, 97.0, "/r/ab-1")
+
+    monkeypatch.setattr(bisect_run, "run_ab", run_ab)
+    monkeypatch.delenv("MODEL", raising=False)
+    assert worker.poll_once() is True
+    assert "+refs/pull/123/head:refs/ab/pr-123" in remote[0]
+    assert seen == [("m" * 40, "e" * 40, 3, "google/gemma-3-1b-it", "-w 5"),
+                    ("m" * 40, "e" * 40, 3, "meta-llama/Llama-2-7b-hf", None)]  # fmt: skip
+    steps = [b["step"] for _, b in posted if b["kind"] == "step"]
+    assert steps[0]["verdict"] == "faster" and steps[0]["change"] == -3.0 and steps[0]["base"] == "m" * 40
+    assert steps[1]["verdict"] == "failed to run"
+    assert posted[-1][1] == {"kind": "done", "result": {"state": "done", "base": "m" * 40}}
+    assert "MODEL" not in os.environ
+
+
+@pytest.mark.parametrize(("ci", "expected"), [((1.0, 2.0), "slower"), ((-2.0, -1.0), "faster"),
+                                               ((-1.0, 1.0), "no significant change")])  # fmt: skip
+def test_pr_verdict(ci, expected):
+    assert worker.verdict(sum(ci) / 2, ci) == expected
