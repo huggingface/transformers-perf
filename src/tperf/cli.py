@@ -11,7 +11,6 @@ huggingface_hub, which only the bench host has.
 import importlib
 import sys
 
-
 # command -> {subcommand: (module[:function], help)}; the subcommand "" runs when the next argument is not a subcommand
 COMMANDS: dict[str, dict[str, tuple[str, str]]] = {
     "ab": {
@@ -59,6 +58,7 @@ COMMANDS: dict[str, dict[str, tuple[str, str]]] = {
     },
     "bisect": {
         "": ("tperf.bisect.run", "find the commit of main that changed a scenario: tperf bisect <good> <bad>"),
+        "worker": ("tperf.bisect.worker", "run the bisect jobs queued from the dashboard's benchmarks page"),
     },
     "deploy": {
         "": ("tperf.host.deploy", "copy the package (harness included) and scenarios to the host, install the timer")

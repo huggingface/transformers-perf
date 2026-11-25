@@ -95,3 +95,11 @@ def test_too_noisy_is_not_a_verdict():
     assert bisect(COMMITS, "good", measure, 1.0, parent, expected=3.0).state == "too_noisy"
     r = bisect(COMMITS, "good", measure, 1.0, parent, expected=5.5)
     assert r.state == "not_reproduced" and "rules out" in r.reason
+
+
+def test_on_step_reports_every_step_as_it_lands():
+    measure, _ = fake_measure({"c17": 6.0})
+    seen = []
+    r = bisect(COMMITS, "good", measure, 1.0, parent, on_step=seen.append)
+    assert [s.role for s in seen] == [s.role for s in r.steps]
+    assert seen[0].role == "reproduce" and seen[-1].role == "confirm"

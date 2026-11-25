@@ -109,10 +109,20 @@ def bisect(
     min_change: float,
     parent: Callable[[str], str],
     expected: float | None = None,
+    on_step: Callable[[Step], None] | None = None,
 ) -> Result:
-    """commits: good..bad, oldest first (the last one is bad). measure(base, head) runs one A/B, None if it failed."""
+    """commits: good..bad, oldest first (the last one is bad). measure(base, head) runs one A/B, None if it failed.
+    on_step is called with each step as soon as it is measured (the worker reports progress with it)."""
     bad = commits[-1]
     result = Result(state="failed", good=good, bad=bad, commits=len(commits))
+
+    class Steps(list):
+        def append(self, step: Step) -> None:
+            super().append(step)
+            if on_step:
+                on_step(step)
+
+    result.steps = Steps()
 
     full = measure(good, bad)
     if full is None:
@@ -255,30 +265,21 @@ def summary(r: Result, metric: str) -> str:
     return "\n".join(lines)
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("good", help="a commit of main with the old performance")
-    parser.add_argument("bad", help="a later commit of main with the new performance")
-    args = parser.parse_args(argv)
-
-    from tperf.ab.compare import METRICS
-
-    os.environ.get("MODEL") or die("set MODEL to a Hugging Face model id")
-    scenarios = os.environ.get("SCENARIOS") or die("set SCENARIOS to a harness config file with one scenario")
-    if sum(1 for line in Path(scenarios).read_text().splitlines() if line.strip() and not line.startswith("#")) != 1:
-        die(f"{scenarios} must hold exactly one scenario: a bisect follows one series")
-    metric = os.environ.get("METRIC", "e2e")
-    if metric not in METRICS:
-        die(f"METRIC must be one of {', '.join(METRICS)}")
-    rounds = int(os.environ.get("ROUNDS", "4"))
-    min_change = float(os.environ.get("MIN_CHANGE", "1.0"))
-    expected = float(os.environ["EXPECTED"]) if os.environ.get("EXPECTED") else None
+def run_job(
+    good: str,
+    bad: str,
+    metric: str = "e2e",
+    rounds: int = 4,
+    min_change: float = 1.0,
+    expected: float | None = None,
+    on_step: Callable[[Step], None] | None = None,
+) -> tuple[dict, Path]:
+    """Bisect good..bad for MODEL and SCENARIOS (from the environment); returns result.json's data and its directory."""
     os.environ.setdefault("GPUS", "1 5")
-
-    commits = first_parent_commits(args.good, args.bad)
+    commits = first_parent_commits(good, bad)
     if not commits:
         die("nothing to bisect: bad is good")
-    good = ssh_out(["git", "-C", TF, "rev-parse", f"{args.good}^{{commit}}"])
+    good = ssh_out(["git", "-C", TF, "rev-parse", f"{good}^{{commit}}"])
     out = ROOT / "results" / f"bisect-{stamp()}-{commits[-1][:10]}"
     out.mkdir(parents=True, exist_ok=True)
     log(f"Bisect {good[:10]}..{commits[-1][:10]}: {len(commits)} commits, {metric}, {rounds} rounds per A/B, in {out}")
@@ -290,6 +291,7 @@ def main(argv: list[str] | None = None) -> int:
         min_change,
         lambda sha: ssh_out(["git", "-C", TF, "rev-parse", f"{sha}^1"]),
         expected,
+        on_step,
     )
     if result.culprit:
         result.culprit["subject"] = subject(result.culprit["sha"])
@@ -300,7 +302,37 @@ def main(argv: list[str] | None = None) -> int:
     text = summary(result, metric)
     (out / "summary.txt").write_text(text + "\n")
     print(text)
-    return 0 if result.state == "culprit" else 1
+    return data, out
+
+
+def check_scenarios(path: str) -> None:
+    lines = [line for line in Path(path).read_text().splitlines() if line.strip() and not line.startswith("#")]
+    if len(lines) != 1:
+        die(f"{path} must hold exactly one scenario: a bisect follows one series")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("good", help="a commit of main with the old performance")
+    parser.add_argument("bad", help="a later commit of main with the new performance")
+    args = parser.parse_args(argv)
+
+    from tperf.ab.compare import METRICS
+
+    os.environ.get("MODEL") or die("set MODEL to a Hugging Face model id")
+    check_scenarios(os.environ.get("SCENARIOS") or die("set SCENARIOS to a harness config file with one scenario"))
+    metric = os.environ.get("METRIC", "e2e")
+    if metric not in METRICS:
+        die(f"METRIC must be one of {', '.join(METRICS)}")
+    data, _ = run_job(
+        args.good,
+        args.bad,
+        metric,
+        int(os.environ.get("ROUNDS", "4")),
+        float(os.environ.get("MIN_CHANGE", "1.0")),
+        float(os.environ["EXPECTED"]) if os.environ.get("EXPECTED") else None,
+    )
+    return 0 if data["state"] == "culprit" else 1
 
 
 if __name__ == "__main__":
