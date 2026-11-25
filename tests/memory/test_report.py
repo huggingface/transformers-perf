@@ -231,6 +231,26 @@ def test_python_section_and_compile_finding(tmp_path):
     assert "No python pass" in render_fragment(profile, None, None, {})["body"]
 
 
+def test_time_report_is_its_own_page():
+    from tperf.common.pystacks import parse_raw, summarize
+    from tperf.memory.profile import PHASE_FUNCTIONS
+    from tperf.memory.report import render_fragment, render_time_fragment
+
+    raw = (
+        "<module> (/r/src/tperf/memory/profile.py:1);_tperf_phase_generations (/r/src/tperf/memory/profile.py:2);"
+        f"generate ({TF}/generation/utils.py:2000);_fn (/venv/torch/_dynamo/eval_frame.py:600) 30\n"
+    )
+    python = summarize(parse_raw(raw), rate=100, phases=PHASE_FUNCTIONS)
+    profile = {"model_id": "org/<m>", "marks": []}
+    links = {"time": "time.html", "python_stacks": "python.folded"}
+    memory = render_fragment(profile, None, None, links, python)["body"]
+    assert "time.html" in memory and "Python time" not in memory and "torch.compile" not in memory
+    time = render_time_fragment(profile, python, {"memory": "report.html", "python_stacks": "python.folded"})
+    assert time["title"] == "Time profile: org/<m>" and "<script" not in time["body"]
+    assert "&lt;m&gt;" in time["body"] and "report.html" in time["body"] and "Python time" in time["body"]
+    assert "torch.compile" in time["body"]  # the compile finding moved with the python pass
+
+
 def test_build_reads_python_summary(tmp_path):
     (tmp_path / "profile.json").write_text(json.dumps({"model_id": "m", "marks": []}))
     (tmp_path / "python_summary.json").write_text(json.dumps(
@@ -240,4 +260,6 @@ def test_build_reads_python_summary(tmp_path):
              "inclusive": []}]}))  # fmt: skip
     (tmp_path / "python.folded").write_text("f (/x/torch/x.py:1) 10\n")
     html = build(tmp_path).read_text()
-    assert "torch/x.py:1 f" in html and "speedscope" in html
+    assert "time.html" in html and "torch/x.py:1 f" not in html
+    time = (tmp_path / "time.html").read_text()
+    assert "torch/x.py:1 f" in time and "speedscope" in time and "report.html" in time

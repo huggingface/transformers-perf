@@ -6,8 +6,8 @@
 Reads profile.json (phase counters, the model's tensors), gpu_snapshot.pickle (the CUDA allocator's history),
 host.memray.bin (memray) and python_summary.json (py-spy, tperf.common.pystacks), each optional. Shows, per device:
 memory over time by category with the phase boundaries, then what held memory at the peak, grouped by the code that
-allocated it, with its stack; then where the Python time went, per phase. Also writes host-flamegraph.html (memray's
-own) next to it when memray is installed.
+allocated it, with its stack. With a python pass, also writes time.html (where the Python time went, per phase) and
+links it. Also writes host-flamegraph.html (memray's own) next to it when memray is installed.
 
 Only the standard library is needed for the GPU part; the host part imports memray.
 """
@@ -751,17 +751,28 @@ def findings(
           "Usually the CUDA context (a few hundred MB): more means library workspaces, another allocator, or a "
           "second context.") if outside is not None and outside > 1024 else None)  # fmt: skip
 
+    time_found, time_passed = time_findings(python)
+    return found + time_found, passed + time_passed
+
+
+def time_findings(python: dict | None) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """The checks on the python pass, for the time report: same shape as findings()."""
     gens = python_group(python, "generations")
-    if gens and gens["seconds"]:
-        compiling = gens["by_area"].get("torch.compile", 0)
-        check("no compilation in the measured generations", ("warn", f"{compiling:.2f} s of the later generations in "
-              "torch.compile code", "Recompiling or guard checks after the first generation: a dynamic shape, or a "
-              "guard that changes between calls.") if compiling > 0.05 * gens["seconds"] else None)  # fmt: skip
-    return found, passed
+    if not gens or not gens["seconds"]:
+        return [], []
+    compiling = gens["by_area"].get("torch.compile", 0)
+    if compiling > 0.05 * gens["seconds"]:
+        return [("warn", f"{compiling:.2f} s of the later generations in torch.compile code",
+                 "Recompiling or guard checks after the first generation: a dynamic shape, or a guard that changes "
+                 "between calls.")], []  # fmt: skip
+    return [], ["no compilation in the measured generations"]
 
 
 def findings_box(profile: dict, gpu: dict | None, host: dict | None, python: dict | None = None) -> str:
-    found, passed = findings(profile, gpu, host, python)
+    return checks_box(*findings(profile, gpu, host, python))
+
+
+def checks_box(found: list[tuple[str, str, str]], passed: list[str]) -> str:
     if not found:
         return ("<div class='findings ok'><strong>Nothing unusual.</strong> <span class='muted'>Checked: "
                 + esc(", ".join(passed)) + ".</span></div>")  # fmt: skip
@@ -862,27 +873,39 @@ def title_of(profile: dict) -> str:
     return f"Memory profile: {profile.get('model_id', '?')}"
 
 
-def render_body(profile: dict, gpu: dict | None, host: dict | None, links: dict, python: dict | None = None) -> str:
-    """The report's content, inside <div class="mem">: every value from the data is escaped, and there is no script.
+def time_title_of(profile: dict) -> str:
+    return f"Time profile: {profile.get('model_id', '?')}"
 
-    links: "flamegraph" and "memory_viz" (URLs, or absent), "files" ([(name, what)] listed at the end)."""
+
+def meta_line(profile: dict) -> str:
+    """The scenario and the versions it ran on, under a report's title."""
     cfg = profile.get("config") or {}
-    marks = profile.get("marks") or []
-    weights = profile.get("weights") or {}
-    load = profile.get("load_memory") or {}
-    names = [m["name"] for m in marks]
     v = profile.get("versions") or {}
-    title = title_of(profile)
-    parts = [f"<div class='mem'><h1>{esc(title)}</h1>"]
     scenario = (f"batch {cfg.get('batch_size')} · prompt {cfg.get('sequence_length')} tokens · "
                 f"{cfg.get('num_tokens_to_generate')} new tokens · {cfg.get('attn_implementation')}"
                 + (f" · compile {cfg['compile_kwargs'].get('mode')}" if cfg.get("compile_kwargs") else "")
                 + (" · continuous batching" if cfg.get("continuous_batching") else ""))  # fmt: skip
-    parts.append(
+    return (
         f"<p class='meta'>{esc(scenario)}<br>transformers <code>{esc(str(profile.get('commit_id', '?'))[:12])}</code>"
         f" ({esc(v.get('transformers'))}) · torch {esc(v.get('torch'))} · CUDA {esc(v.get('cuda'))} · "
         f"{esc(profile.get('gpu_name') or 'no GPU')}</p>"
     )
+
+
+def render_body(profile: dict, gpu: dict | None, host: dict | None, links: dict, python: dict | None = None) -> str:
+    """The report's content, inside <div class="mem">: every value from the data is escaped, and there is no script.
+
+    links: "flamegraph" and "memory_viz" (URLs, or absent), "time" (the time report, which then holds the python
+    pass instead of this page), "files" ([(name, what)] listed at the end)."""
+    marks = profile.get("marks") or []
+    weights = profile.get("weights") or {}
+    load = profile.get("load_memory") or {}
+    names = [m["name"] for m in marks]
+    title = title_of(profile)
+    parts = [f"<div class='mem'><h1>{esc(title)}</h1>", meta_line(profile)]
+    if links.get("time"):
+        parts.append(f"<p>Where the time went: <a href='{esc(links['time'])}'>time report</a> (py-spy).</p>")
+        python = None
     if profile.get("error"):
         parts.append(f"<div class='error'>The scenario failed: <code>{esc(profile['error'])}</code>. "
                      "Everything below was recorded up to the failure.</div>")  # fmt: skip
@@ -1006,7 +1029,8 @@ def render_body(profile: dict, gpu: dict | None, host: dict | None, links: dict,
             + sites_table(host["mmap_sites"], host["peak_bytes"], show_allocators=True)
         )  # fmt: skip
 
-    parts.append(python_section(python, links))
+    if not links.get("time"):
+        parts.append(python_section(python, links))
 
     if links.get("files"):
         parts.append(
@@ -1027,6 +1051,37 @@ def render(profile: dict, gpu: dict | None, host: dict | None, links: dict, pyth
         f"content='width=device-width,initial-scale=1'><title>{esc(title_of(profile))}</title>"
         f"<style>{TOKENS}{RULES}</style></head><body>{render_body(profile, gpu, host, links, python)}</body></html>"
     )
+
+
+def render_time_body(profile: dict, python: dict | None, links: dict) -> str:
+    """The time report: the python pass of the profile run, with the same guarantees as render_body (no script, every
+    value escaped). links: "memory" (the memory report), "python_stacks" (the folded stacks)."""
+    parts = [f"<div class='mem'><h1>{esc(time_title_of(profile))}</h1>", meta_line(profile)]
+    if links.get("memory"):
+        parts.append(f"<p>Where the memory went: <a href='{esc(links['memory'])}'>memory report</a>.</p>")
+    if python:
+        parts.append(checks_box(*time_findings(python)))
+    parts.append(python_section(python, links))
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def render_time(profile: dict, python: dict | None, links: dict) -> str:
+    """The time report as a standalone page."""
+    return (
+        f"<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' "
+        f"content='width=device-width,initial-scale=1'><title>{esc(time_title_of(profile))}</title>"
+        f"<style>{TOKENS}{RULES}</style></head><body>{render_time_body(profile, python, links)}</body></html>"
+    )
+
+
+def render_time_fragment(profile: dict, python: dict | None, links: dict) -> dict:
+    """The time report for a host page, like render_fragment: {title, css, body}."""
+    return {
+        "title": time_title_of(profile),
+        "css": SITE_TOKENS + RULES,
+        "body": render_time_body(profile, python, links),
+    }
 
 
 def render_fragment(
@@ -1099,6 +1154,14 @@ def build(profile_dir: Path) -> Path:
     if (profile_dir / "python.folded").exists():
         links["python_stacks"] = "python.folded"
         files.append(("python.folded", "py-spy's stacks, folded (speedscope.app, flamegraph.pl)"))
+    if python is not None:
+        time_links = {
+            "memory": "report.html",
+            **({"python_stacks": "python.folded"} if "python_stacks" in links else {}),
+        }
+        (profile_dir / "time.html").write_text(render_time(profile, python, time_links))
+        links["time"] = "time.html"
+        files.append(("time.html", "the time report: the python pass"))
     out = profile_dir / "report.html"
     out.write_text(render(profile, gpu, host, links, python))
     return out

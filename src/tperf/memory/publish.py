@@ -14,7 +14,7 @@ from pathlib import Path
 
 FILES = [
     *("report.html", "host-flamegraph.html", "profile.json", "gpu_summary.json", "host_summary.json"),
-    *("host.memray.bin", "gpu_snapshot.pickle.gz", "python_summary.json", "python.folded"),
+    *("host.memray.bin", "gpu_snapshot.pickle.gz", "python_summary.json", "python.folded", "time.html"),
 ]
 
 
