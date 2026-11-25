@@ -231,6 +231,9 @@ def main(argv: list[str] | None = None) -> int:
             ran = False
         if args.once:
             return 0
+        if ran and os.environ.get("INVOCATION_ID"):
+            # under systemd (Restart=always): exit after a job, so the next one runs the package as deployed now
+            return 0
         if not ran:
             time.sleep(POLL)
 
