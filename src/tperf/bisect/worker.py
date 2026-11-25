@@ -155,51 +155,72 @@ def report(job_id: str, body: dict) -> None:
         time.sleep(10 * (attempt + 1))
 
 
-NO_CHANGE_WITHIN = 1.0  # %: a 95% CI inside ±this, around zero, says nothing moved; a wider one cannot tell
+def ab_pr(pr: int, rounds: int) -> str:
+    """`tperf ab <pr> <rounds>` with the environment as set (MODEL, SCENARIOS, BENCH_ARGS, GPUS, PUBLISH_REPO), output
+    streamed; the A/B's results directory, or "" if it did not start."""
+    import re as _re
 
+    from tperf.common.benchlib import PKG_SRC
 
-def verdict(change: float, ci: tuple[float, float]) -> str:
-    """Head vs base, positive = slower (the metrics are latencies). A CI that covers zero is "no significant change"
-    only when it is tight; otherwise the run was too noisy to tell, and says how noisy."""
-    if ci[0] > 0:
-        return "slower"
-    if ci[1] < 0:
-        return "faster"
-    if max(-ci[0], ci[1]) <= NO_CHANGE_WITHIN:
-        return "no significant change"
-    return f"inconclusive (±{(ci[1] - ci[0]) / 2:.1f}%)"
+    env = dict(os.environ, PROFILE="0")
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(PKG_SRC), env.get("PYTHONPATH", "")) if p)
+    for k in ("BASE", "HEAD"):  # the PR's merge base and head, as tperf ab picks them
+        env.pop(k, None)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "tperf.ab.run", str(pr), str(rounds)], env=env, stdout=subprocess.PIPE, text=True
+    )
+    out_dir = ""
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        if found := _re.search(r"results in (\S+)\s*$", line):
+            out_dir = found[1]
+    proc.wait()  # exits 1 on a REGRESSION verdict too: the rows decide
+    return out_dir
 
 
 def run_pr(job: dict) -> None:
-    """A PR bench: `tperf ab` of the PR head against its merge-base with main, one step per daily scenario."""
-    from tperf.bisect.run import run_ab
-    from tperf.common.benchlib import REPO_URL, TF, ssh, ssh_out
+    """A PR bench: `tperf ab <pr>` (head against its merge base with main, GPUs swapped each round), once per model
+    with its daily scenarios, published to the dataset like any `tperf ab`, so /benchmarks/pr-<n> shows the full
+    report. One step per scenario: its e2e change, CI and `tperf ab compare`'s verdict, the same as that page."""
+    from pathlib import Path
 
-    job_id, pr, head = str(job["id"]), int(job["pr"]), str(job["head"])
-    log(f"Job {job_id}: PR #{pr} at {head[:10]}, {len(job['scenarios'])} scenarios")
-    git = ["git", "-C", TF]
-    ssh([*git, "fetch", "-q", REPO_URL, "+main:refs/ab/main", f"+refs/pull/{pr}/head:refs/ab/pr-{pr}"])
-    if ssh_out([*git, "rev-parse", f"refs/ab/pr-{pr}"]) != head:
-        log(f"PR #{pr} moved since it was queued; benching the queued head {head[:10]}")
-    base = ssh_out([*git, "merge-base", "refs/ab/main", head])
-    measured = 0
+    from tperf.ab.compare import analyze
+    from tperf.common.record import scenario_rows
+
+    job_id, pr = str(job["id"]), int(job["pr"])
+    metric, rounds = job.get("metric") or "e2e", int(job.get("rounds") or 6)
+    log(f"Job {job_id}: PR #{pr}, {len(job['scenarios'])} scenarios")
+    groups: dict[tuple[str, str], list[dict]] = {}
     for sc in job["scenarios"]:
-        step = {"model": sc["model"], "scenario": sc["label"], "base": base, "head": head}
-        with scenario_env(sc):
-            m = run_ab(base, head, int(job.get("rounds") or 3), job.get("metric") or "e2e")
-        if m is None:
-            step.update(change=None, ci=None, verdict="failed to run")
-        else:
-            measured += 1
-            step.update(change=round(m.change, 2), ci=[round(c, 2) for c in m.ci], verdict=verdict(m.change, m.ci),
-                        base_ms=m.base, head_ms=m.head, ab_dir=m.ab_dir)  # fmt: skip
-        report(job_id, {"kind": "step", "step": step})
-    if measured:
-        report(job_id, {"kind": "done", "result": {"state": "done", "base": base}})
-    else:
-        report(
-            job_id, {"kind": "done", "result": {"state": "failed", "reason": "no scenario ran (see the worker log)"}}
-        )
+        groups.setdefault((sc["model"], sc.get("bench_args") or ""), []).append(sc)
+    measured, ab_ids, commits = 0, [], {}
+    for (model, bench_args), scs in groups.items():
+        with scenario_env({"model": model, "bench_args": bench_args, "scenarios": [sc["scenario"] for sc in scs]}):
+            out_dir = ab_pr(pr, rounds)
+        rows = [r for d in sorted(Path(out_dir).glob("round*-*")) if (d / "manifest.json").exists()
+                for r in scenario_rows(d)] if out_dir else []  # fmt: skip
+        if out_dir:
+            ab_ids.append(Path(out_dir).name.removeprefix("ab-"))
+        entries = analyze(rows)["scenarios"] if rows else []
+        for sc in scs:
+            step = {"model": model, "scenario": sc["label"]}
+            entry = next((e for e in entries if e["pairs"] and e["pairs"][0][1]["base"].get("attn_implementation")
+                          == sc["scenario"].get("attn_implementation")), None)  # fmt: skip
+            m = next((m for m in entry["metrics"] if m["name"] == metric), None) if entry else None
+            if m is None:
+                step.update(change=None, ci=None, verdict="failed to run")
+            else:
+                measured += 1
+                base_row, head_row = entry["pairs"][0][1]["base"], entry["pairs"][0][1]["head"]
+                commits = {"base": base_row.get("commit_id"), "head": head_row.get("commit_id")}
+                step.update(change=round(m["change_pct"], 2), ci=[round(c, 2) for c in m["ci"]],
+                            verdict=m["verdict"], base_ms=m["base"], head_ms=m["head"], rounds=entry["rounds"],
+                            **commits)  # fmt: skip
+            report(job_id, {"kind": "step", "step": step})
+    result = {"state": "done" if measured else "failed", "page": f"/benchmarks/pr-{pr}", "ab_ids": ab_ids, **commits}
+    if not measured:
+        result["reason"] = "no scenario ran (see the worker log)"
+    report(job_id, {"kind": "done", "result": result})
 
 
 class scenario_env:
@@ -212,7 +233,8 @@ class scenario_env:
 
     def __enter__(self):
         with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
-            f.write(json.dumps(self.sc["scenario"]) + "\n")
+            for config in self.sc.get("scenarios") or [self.sc["scenario"]]:
+                f.write(json.dumps(config) + "\n")
             self.path = f.name
         self.saved = {k: os.environ.get(k) for k in self.KEYS}
         os.environ.update(MODEL=self.sc["model"], SCENARIOS=self.path)

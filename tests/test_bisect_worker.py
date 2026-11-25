@@ -95,45 +95,44 @@ PR_JOB = {"id": "abc", "kind": "pr", "pr": 123, "head": "e" * 40, "metric": "e2e
                          "bench_args": ""}]}  # fmt: skip
 
 
-def test_pr_bench_runs_each_scenario_against_the_merge_base(monkeypatch):
+def test_pr_bench_runs_tperf_ab_per_model_and_reports_its_verdicts(tmp_path, monkeypatch):
     import os
+    from pathlib import Path
 
-    from tperf.bisect import run as bisect_run
-    from tperf.bisect.run import Measurement
-    from tperf.common import benchlib
+    from tperf.ab import compare
+    from tperf.common import record
 
     posted = fake_api(monkeypatch, PR_JOB)
-    remote = []
-    monkeypatch.setattr(benchlib, "ssh", lambda cmd, **kw: remote.append(cmd))
-    monkeypatch.setattr(benchlib, "ssh_out", lambda cmd: "e" * 40 if "rev-parse" in cmd else "m" * 40)
+    out = tmp_path / "ab-20261125-pr123"
+    (out / "round1-base").mkdir(parents=True)
+    (out / "round1-base" / "manifest.json").write_text("{}")
     seen = []
 
-    def run_ab(base, head, rounds, metric):
-        seen.append((base, head, rounds, os.environ["MODEL"], os.environ.get("BENCH_ARGS")))
-        if os.environ["MODEL"].startswith("meta"):
-            return None
-        return Measurement(-3.0, (-4.0, -2.0), 100.0, 97.0, "/r/ab-1")
+    def ab_pr(pr, rounds):
+        seen.append((pr, rounds, os.environ["MODEL"], Path(os.environ["SCENARIOS"]).read_text().count("\n")))
+        return str(out) if os.environ["MODEL"].startswith("google") else ""
 
-    monkeypatch.setattr(bisect_run, "run_ab", run_ab)
+    def side(sha):
+        return {"attn_implementation": "flash_attention_2", "commit_id": sha}
+
+    entries = [{"pairs": [(1, {"base": side("m" * 40), "head": side("e" * 40)})], "rounds": 6,
+                "metrics": [{"name": "e2e", "change_pct": -3.0, "ci": [-4.0, -2.0], "base": 100.0, "head": 97.0,
+                             "verdict": "improvement"}]}]  # fmt: skip
+    monkeypatch.setattr(worker, "ab_pr", ab_pr)
+    monkeypatch.setattr(record, "scenario_rows", lambda d: [{"row": 1}])
+    monkeypatch.setattr(compare, "analyze", lambda rows: {"scenarios": entries})
     monkeypatch.delenv("MODEL", raising=False)
     monkeypatch.delenv("GPUS", raising=False)
     assert worker.poll_once() is True
     assert os.environ.pop("GPUS") == "1 5"
-    assert "+refs/pull/123/head:refs/ab/pr-123" in remote[0]
-    assert seen == [("m" * 40, "e" * 40, 3, "google/gemma-3-1b-it", "-w 5"),
-                    ("m" * 40, "e" * 40, 3, "meta-llama/Llama-2-7b-hf", None)]  # fmt: skip
+    assert seen == [(123, 3, "google/gemma-3-1b-it", 1), (123, 3, "meta-llama/Llama-2-7b-hf", 1)]
     steps = [b["step"] for _, b in posted if b["kind"] == "step"]
-    assert steps[0]["verdict"] == "faster" and steps[0]["change"] == -3.0 and steps[0]["base"] == "m" * 40
+    assert steps[0]["verdict"] == "improvement" and steps[0]["change"] == -3.0 and steps[0]["base"] == "m" * 40
     assert steps[1]["verdict"] == "failed to run"
-    assert posted[-1][1] == {"kind": "done", "result": {"state": "done", "base": "m" * 40}}
+    result = posted[-1][1]["result"]
+    assert result["state"] == "done" and result["page"] == "/benchmarks/pr-123"
+    assert result["ab_ids"] == ["20261125-pr123"]
     assert "MODEL" not in os.environ
-
-
-@pytest.mark.parametrize(("ci", "expected"), [((1.0, 2.0), "slower"), ((-2.0, -1.0), "faster"),
-                                               ((-0.8, 0.9), "no significant change"),
-                                               ((-3.32, 8.57), "inconclusive (±5.9%)")])  # fmt: skip
-def test_pr_verdict(ci, expected):
-    assert worker.verdict(sum(ci) / 2, ci) == expected
 
 
 def test_daily_due_once_a_day_after_its_time_and_not_on_a_fresh_install(tmp_path, monkeypatch):
