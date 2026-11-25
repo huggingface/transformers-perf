@@ -21,7 +21,7 @@ import re
 import statistics
 import sys
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tperf.ab.compare import analyze
@@ -399,6 +399,22 @@ VERDICT_CLASS = {
 }
 
 
+def link_ab_profiles(abs_: list[dict], reports: dict[str, str], days: int = MEMORY_DAYS) -> list[str]:
+    """Set run["profiles"] ({side: the report's path in the Space}) on the A/B runs of the last `days` days whose base
+    and head were profiled (tperf ab with PROFILE: groups <ab id>-base and <ab id>-head); returns their groups."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    groups = []
+    for run in abs_:
+        if run["date"] < cutoff:
+            continue
+        for side in ("base", "head"):
+            group = f"{run['ab_id']}-{side}"
+            if group in reports:
+                run.setdefault("profiles", {})[side] = f"memory/{group}/report.html"
+                groups.append(group)
+    return groups
+
+
 def build(rows: list[dict], proc_rows: list[dict] = (), reports: dict[str, str] | None = None) -> dict[str, dict]:
     """Page file name -> page data. With `reports` (memory_reports), pages["_memory"] lists the reports to copy."""
     latest = max(rows, key=lambda r: r["started_at"]) if rows else {}
@@ -411,6 +427,7 @@ def build(rows: list[dict], proc_rows: list[dict] = (), reports: dict[str, str] 
     memory = link_memory_reports(series, reports or {})
     procs = processor_series(list(proc_rows))
     abs_ = ab_results(rows)
+    memory += link_ab_profiles(abs_, reports or {})
     by_pr: dict[int | None, list[dict]] = defaultdict(list)
     for a in abs_:
         by_pr[int(a["pr"]) if a["pr"] else None].append(a)

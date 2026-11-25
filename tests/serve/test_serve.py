@@ -186,3 +186,54 @@ def test_serve_ab_is_analyzed_and_labelled(tmp_path):
     assert ttft["verdict"] == "improvement" and ttft["change_pct"] < -50
     (run,) = ab_results(rows)
     assert run["pr"] == 1 and run["scenarios"][0]["scenario"] == "transformers serve, chat · 8 requests of 64 tokens"
+
+
+def test_ab_profiles_are_linked_per_side():
+    from datetime import datetime, timedelta, timezone
+
+    from tperf.dashboard.build import link_ab_profiles
+
+    now = datetime.now(timezone.utc)
+    runs = [{"ab_id": "new-pr1", "date": now.isoformat()},
+            {"ab_id": "old-pr1", "date": (now - timedelta(days=30)).isoformat()}]  # fmt: skip
+    reports = {"new-pr1-base": "memory/2026-11/new-pr1-base", "new-pr1-head": "memory/2026-11/new-pr1-head",
+               "old-pr1-base": "memory/2026-10/old-pr1-base"}  # fmt: skip
+    assert link_ab_profiles(runs, reports) == ["new-pr1-base", "new-pr1-head"]
+    assert runs[0]["profiles"] == {
+        "base": "memory/new-pr1-base/report.html",
+        "head": "memory/new-pr1-head/report.html",
+    }
+    assert "profiles" not in runs[1]  # past the reports the dashboard keeps
+
+
+def test_ab_profile_args_keep_the_shapes():
+    from tperf.ab.run import profile_args
+
+    assert profile_args("-w 5 -i 10 -b 1 -s 128 -n 64", "", "/ab") == ["-b", "1", "-s", "128", "-n", "64"]
+    assert profile_args("-w 5 -b 2", "x.jsonl", "/ab")[-4:] == ["--config-file", "/ab/scenarios.jsonl",
+                                                              "--scenario-index", "0"]  # fmt: skip
+
+
+def test_profiled_serve_run_becomes_a_time_report(tmp_path):
+    from tperf.serve.report import convert
+
+    serve = tmp_path / "serve"
+    serve.mkdir()
+    profile = {"wall_s": 10.0, "native": False, "groups": [
+        {"name": "Thread-3 (_run): InferenceThread._run", "samples": 800, "seconds": 8.0, "busy_share": 0.8,
+         "by_area": {"transformers generation": 8.0},
+         "self": [{"function": "transformers/generation/utils.py:395 StopCheck.__call__",
+                   "area": "transformers generation", "samples": 800, "seconds": 8.0}], "inclusive": []}]}  # fmt: skip
+    results = {"model_id": "m", "commit": "abc123", "scenario": "chat", "error": None, "profile": profile,
+               "args": {"profile_rate": 100, "conversations": 3, "turns": 8, "max_tokens": 64, "concurrency": 1,
+                        "server_args": "--attn-implementation sdpa"},
+               "turns": [{"completion_tokens": 64}] * 24}  # fmt: skip
+    (serve / "results.json").write_text(json.dumps(results))
+    (serve / "server.folded").write_text("f (/x/torch/x.py:1) 10\n")
+    convert(serve, tmp_path / "profile")
+    time = (tmp_path / "profile" / "time.html").read_text()
+    assert "transformers serve · chat · 3 conversation(s) × 8 turns" in time and "StopCheck.__call__" in time
+    assert "6.51 ms" in time  # 10 s of wall time / 1536 tokens
+    assert "report.html" not in time and "Checked: ." not in time  # no memory pass, no empty checks box
+    memory = (tmp_path / "profile" / "report.html").read_text()
+    assert "time.html" in memory and "no memory pass" in memory

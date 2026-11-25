@@ -43,6 +43,7 @@ COMMANDS: dict[str, dict[str, tuple[str, str]]] = {
         ),
         "bench": ("tperf.serve.bench", "the same, here (any machine): start transformers serve, play conversations"),
         "summarize": ("tperf.serve.summarize", "print serve results, or compare runs turn by turn"),
+        "report": ("tperf.serve.report", "a profiled serve run (--profile) as a time report: report.html, time.html"),
     },
     "baselines": {
         "run": ("tperf.baselines.run", "bf16 GEMM and host<->device bandwidth"),

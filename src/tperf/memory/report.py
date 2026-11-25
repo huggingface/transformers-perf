@@ -837,8 +837,13 @@ def python_section(python: dict | None, links: dict) -> str:
         "py-spy uses a CPU. Time inside a C call (a torch "
         "op, a CUDA synchronization) is charged to the Python line that made it"
         + (", with native frames below it" if python.get("native") else "")
-        + ". Threads add up: sampled time can exceed wall time. Per token: divided by the tokens the phase generated "
-        "(batch × new tokens × generations).</p>"
+        + ". Threads add up: sampled time can exceed wall time. "
+        + (
+            "Each group is a thread of the server, sampled during the measured conversations only (loading and warm-up "
+            "excluded). Per token: the wall time divided by the tokens streamed, prefill included.</p>"
+            if python.get("serve")
+            else "Per token: divided by the tokens the phase generated (batch × new tokens × generations).</p>"
+        )
     )
     groups = sorted(python.get("groups", []), key=lambda g: PYTHON_PHASES.index(g["name"])
                     if g["name"] in PYTHON_PHASES else len(PYTHON_PHASES))  # fmt: skip
@@ -847,7 +852,8 @@ def python_section(python: dict | None, links: dict) -> str:
         wall = g.get("wall_seconds")
         tiles = [tile("Sampled", f"{g['seconds']:,.2f} s", f"{g['samples']:,} samples")]
         if wall:
-            tiles.append(tile("Wall time", f"{wall:,.2f} s", "between the phase's boundaries"))
+            tiles.append(tile("Wall time", f"{wall:,.2f} s", "of the measured conversations" if python.get("serve")
+                              else "between the phase's boundaries"))  # fmt: skip
         if tokens and wall:
             tiles.append(tile("Per token", f"{wall / tokens * 1e3:,.2f} ms", f"{tokens:,} tokens"))
         open_attr = " open" if g["name"] == "generations" else ""
@@ -879,6 +885,13 @@ def time_title_of(profile: dict) -> str:
 
 def meta_line(profile: dict) -> str:
     """The scenario and the versions it ran on, under a report's title."""
+    if profile.get("kind") == "serve":  # tperf.serve.report
+        sv = profile.get("serve") or {}
+        scenario = (f"transformers serve · {sv.get('scenario')} · {sv.get('conversations')} conversation(s) × "
+                    f"{sv.get('turns')} turns · replies of {sv.get('max_tokens')} tokens · concurrency "
+                    f"{sv.get('concurrency')} · server args: {sv.get('server_args') or 'none'}")  # fmt: skip
+        return (f"<p class='meta'>{esc(scenario)}<br>transformers "
+                f"<code>{esc(str(profile.get('commit_id', '?'))[:12])}</code></p>")  # fmt: skip
     cfg = profile.get("config") or {}
     v = profile.get("versions") or {}
     scenario = (f"batch {cfg.get('batch_size')} · prompt {cfg.get('sequence_length')} tokens · "
@@ -906,6 +919,10 @@ def render_body(profile: dict, gpu: dict | None, host: dict | None, links: dict,
     if links.get("time"):
         parts.append(f"<p>Where the time went: <a href='{esc(links['time'])}'>time report</a> (py-spy).</p>")
         python = None
+    if profile.get("kind") == "serve":
+        parts.append("<p class='muted'>A <code>transformers serve</code> run has no memory pass: only its time is "
+                     "profiled.</p></div>")  # fmt: skip
+        return "".join(parts)
     if profile.get("error"):
         parts.append(f"<div class='error'>The scenario failed: <code>{esc(profile['error'])}</code>. "
                      "Everything below was recorded up to the failure.</div>")  # fmt: skip
@@ -1059,8 +1076,9 @@ def render_time_body(profile: dict, python: dict | None, links: dict) -> str:
     parts = [f"<div class='mem'><h1>{esc(time_title_of(profile))}</h1>", meta_line(profile)]
     if links.get("memory"):
         parts.append(f"<p>Where the memory went: <a href='{esc(links['memory'])}'>memory report</a>.</p>")
-    if python:
-        parts.append(checks_box(*time_findings(python)))
+    found, passed = time_findings(python)
+    if found or passed:
+        parts.append(checks_box(found, passed))
     parts.append(python_section(python, links))
     parts.append("</div>")
     return "".join(parts)
@@ -1155,10 +1173,9 @@ def build(profile_dir: Path) -> Path:
         links["python_stacks"] = "python.folded"
         files.append(("python.folded", "py-spy's stacks, folded (speedscope.app, flamegraph.pl)"))
     if python is not None:
-        time_links = {
-            "memory": "report.html",
-            **({"python_stacks": "python.folded"} if "python_stacks" in links else {}),
-        }
+        time_links = {} if profile.get("kind") == "serve" else {"memory": "report.html"}  # serve: no memory pass
+        if "python_stacks" in links:
+            time_links["python_stacks"] = "python.folded"
         (profile_dir / "time.html").write_text(render_time(profile, python, time_links))
         links["time"] = "time.html"
         files.append(("time.html", "the time report: the python pass"))

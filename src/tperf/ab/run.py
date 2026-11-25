@@ -32,6 +32,11 @@ Environment:
                 (GPUS defaults to "0,1 4,5" for TP=2, "0,1,2,3 4,5,6,7" for TP=4), NCORES cores per rank
   NCCL_ENV="NCCL_CUMEM_HOST_ENABLE=0"   for TP > 1, see `tperf baselines p2p`
   PUBLISH_REPO  publish every run to this dataset (rows tagged ab_id / ab_side / ab_round)
+  PROFILE=1     after the rounds, one memory and time profile per side (tperf.memory.profile: the bench shapes and the
+                first scenario, base and head at the same time, one per GPU), fetched to profile-<side>/ and published
+                as memory/<month>/<ab id>-<side>/ with PUBLISH_REPO; the PR's dashboard page links them. With SERVE,
+                the side's conversation again with py-spy on the server, as a time report only. Not timed: the rounds
+                are over. PROFILE=0 skips it; it is skipped for TP > 1
   DASHBOARD_SPACE  old static Space to rebuild after publishing (default: [hub] dashboard_space in tperf.toml,
                 none: results are browsed at transformers-ci /benchmarks)
 
@@ -76,6 +81,58 @@ def names(paths: list[str]) -> str:
     return ",".join(os.path.basename(p) for p in paths)
 
 
+def profile_args(bench_args: str, scenarios: str, ab: str) -> list[str]:
+    """tperf.memory.profile arguments for an A/B's scenario: the bench shapes (its warmup and iteration counts are for
+    timing, not for this) and the first scenario of SCENARIOS, like the daily profiles."""
+    shapes = shlex.split(bench_args)
+    flags = ("-b", "-s", "-n", "--batch-size", "--sequence-length", "--num-tokens-to-generate")
+    keep = [x for i, x in enumerate(shapes) if x in flags or (i and shapes[i - 1] in flags)]
+    return keep + (["--config-file", f"{ab}/scenarios.jsonl", "--scenario-index", "0"] if scenarios else [])
+
+
+def profile_sides(
+    ab, ab_id, model, bench_args, scenarios, gpus, node_of, ncores, head_src, publish_repo, out, shas, serve_args=None
+) -> None:
+    """One memory and time profile per side, both at once (one per GPU), then fetched and published. Informative:
+    a failure is reported and changes nothing else. With serve_args (SERVE), each side's serve conversation again
+    with py-spy on the server (tperf.serve.bench --profile), as a time report (tperf.serve.report)."""
+    log("Profiling base and head (memory and time, not timed)")
+    procs = []
+    for side, group in (("base", gpus[0]), ("head", gpus[1])):
+        node = node_of[group]
+        src = f"{ab}/src" if side == "base" else f"{ab}/{head_src}"
+        d = f"{ab}/profile-{side}"
+        env = {**HF_ENV, "HF_HUB_OFFLINE": 1, "PYTHONPATH": f"{src}:{ab}/{side}/src", "CUDA_VISIBLE_DEVICES": group,
+               "OMP_NUM_THREADS": ncores}  # fmt: skip
+        pin = ["numactl", f"--physcpubind={cpus_for(node, ncores)}", f"--membind={node}"]
+        if serve_args is None:
+            work = [PY, "-m", "tperf.memory.profile", "--model-id", model, "--out", d, "--no-keep-snapshot",
+                    *profile_args(bench_args, scenarios, ab)]  # fmt: skip
+            script = cmd([*env_args(env), *pin, *work])
+        else:
+            bench = [PY, "-m", "tperf.serve.bench", "--model-id", model, "--out", f"{d}/serve", "--python", PY,
+                     "--commit", shas[side], "--profile", *serve_args]  # fmt: skip
+            report = [PY, "-m", "tperf.serve.report", f"{d}/serve", d]
+            script = f"{cmd([*env_args(env), *pin, *bench])} && {cmd([*env_args(env), *report])}"
+        procs.append(
+            (side, d, subprocess.Popen([*SSH, HOST, f"mkdir -p {d} && cd /tmp && {{ {script}; }} >{d}.log 2>&1"]))
+        )
+    for side, d, proc in procs:
+        if proc.wait():
+            print(f"warning: the {side} profile failed, see {d}.log on the host", file=sys.stderr)
+            continue
+        try:
+            scp_from(d, out, recursive=True)
+        except subprocess.CalledProcessError:
+            print(f"warning: fetching the {side} profile failed", file=sys.stderr)
+        if publish_repo:
+            hub_env = env_args({**HF_ENV, "HF_HUB_DISABLE_PROGRESS_BARS": 1})
+            publish = [*hub_env, *remote_module(PY, "memory.publish", f"{ab}/src"), d, "--repo", publish_repo,
+                       "--group", f"{ab_id}-{side}"]  # fmt: skip
+            if ssh(cmd(publish), check=False).returncode:
+                print(f"warning: publishing the {side} profile failed", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("pr", help="PR number, or `main`")
@@ -92,6 +149,7 @@ def main(argv: list[str] | None = None) -> None:
     gpus = os.environ.get("GPUS", DEFAULT_GPUS[tp]).split()
     nccl_env = os.environ.get("NCCL_ENV", "NCCL_CUMEM_HOST_ENABLE=0")
     publish_repo = os.environ.get("PUBLISH_REPO", "")
+    profile = os.environ.get("PROFILE", "1") != "0"
     dashboard_space = os.environ.get("DASHBOARD_SPACE", DASHBOARD_SPACE)
     scenarios = os.environ.get("SCENARIOS", "")
     harness_patches = patches("HARNESS_PATCHES")
@@ -305,6 +363,15 @@ def main(argv: list[str] | None = None) -> None:
                 sys.exit(1)
             for side in ("base", "head"):
                 scp_from(f"{ab}/results/round{r}-{side}", out, recursive=True)
+
+        if profile and tp == 1:
+            serve_args = None
+            if serve:
+                serve_args = ["--config-file", f"{ab}/serve-scenarios.jsonl", "--scenario-index", serve_index,
+                              *serve_extra]  # fmt: skip
+            shas = {"base": base_sha, "head": head_sha}
+            profile_sides(ab, ab_id, model, bench_args, scenarios, gpus, node_of, ncores, head_src, publish_repo, out,
+                          shas, serve_args)  # fmt: skip
 
     # A regression must not stop publishing: keep the verdict for the exit status
     compare = run_module("ab.compare", out, stdout=subprocess.PIPE, text=True)
