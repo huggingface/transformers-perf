@@ -57,6 +57,9 @@ COMMANDS: dict[str, dict[str, tuple[str, str]]] = {
         "tune": ("tperf.host.deploy:tune", "tune the host for low noise: tperf host tune [apply|status|revert]"),
         "install": ("tperf.host.deploy:install", "install CUDA, nvbandwidth, torch, transformers under /opt/bench"),
     },
+    "bisect": {
+        "": ("tperf.bisect.run", "find the commit of main that changed a scenario: tperf bisect <good> <bad>"),
+    },
     "deploy": {
         "": ("tperf.host.deploy", "copy the package (harness included) and scenarios to the host, install the timer")
     },

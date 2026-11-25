@@ -22,6 +22,8 @@ Environment:
                 merged as and base is its parent, i.e. main right before the merge)
   HARNESS_PATCHES  patches to the harness applied to both sides (default: none), e.g. patches/*.patch; paths
                 start with src/tperf/harness/ (relative to this repository's root)
+  HEAD          with `main`: the commit of main to use as head (default: the main tip); with BASE, an A/B of
+                any two commits of main (what `tperf bisect` runs at each step)
   HEAD_PATCHES  patches applied to the head side's transformers checkout (with `main`: test a change before
                 opening its PR; base is the main tip, head is the main tip plus the patches)
   HEAD_EXTRA_PATCHES  patches applied to the head side's harness only (a separate copy of the package), to A/B a
@@ -189,9 +191,10 @@ def main(argv: list[str] | None = None) -> None:
     if pr == "main":
         log("Fetching main")
         ssh([*git, "fetch", "-q", REPO_URL, "+main:refs/ab/main"])
-        head_sha = ssh_out([*git, "rev-parse", "refs/ab/main"])
-        base_sha = ssh_out([*git, "rev-parse", base or head_sha])
-        pr_num, name = "", "main"
+        head = os.environ.get("HEAD", "")
+        head_sha = ssh_out([*git, "rev-parse", "--verify", f"{head or 'refs/ab/main'}^{{commit}}"])
+        base_sha = ssh_out([*git, "rev-parse", "--verify", f"{base or head_sha}^{{commit}}"])
+        pr_num, name = "", f"main-{head_sha[:10]}" if head else "main"
         if head_patches:
             name = os.path.basename(head_patches[0]).removesuffix(".patch")
     else:

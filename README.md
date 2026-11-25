@@ -92,6 +92,7 @@ tperf deploy                           # copy tperf (harness included) and scena
 
 ```bash
 MODEL=google/gemma-3-1b-it SCENARIOS=scenarios/sliding-window.jsonl tperf ab 49542   # a PR against its base
+MODEL=google/gemma-3-1b-it SCENARIOS=<one scenario>.jsonl tperf bisect <good> <bad>   # which commit of main moved it
 tperf processors run                   # processors and encoders
 tperf baselines run                    # GEMM and host<->device bandwidth
 MODEL=meta-llama/Llama-2-7b-hf NCORES=6 tperf noise soak --hours 3   # how noisy is this host? (run on two, then
@@ -102,7 +103,9 @@ tperf --help                           # every command
 ```
 
 `tperf ab` runs base and head at the same time on two GPUs (one per NUMA node), swaps them every round, and reports
-each metric's change with a 95% confidence interval. The daily run (03:00 UTC) benchmarks the latest main and
+each metric's change with a 95% confidence interval. `tperf bisect` chains such A/Bs over the commits between two
+daily points: it first re-runs the two daily commits against each other and stops if the change does not reproduce
+(then it was not transformers), then bisects, then confirms the culprit against its parent. The daily run (03:00 UTC) benchmarks the latest main and
 rebuilds the dashboard.
 
 ## Layout
