@@ -206,9 +206,33 @@ def main_series(rows: list[dict]) -> list[dict]:
                 "scenario": scenario_label(first),
                 "gpu": f"{first.get('gpu_name')} #{first.get('gpu_index')}",
                 "points": points,
+                "bisect": bisect_job(srows[-1]),
             }
         )
     return every_day(sorted(series, key=lambda s: (s["model"], s["scenario"])))
+
+
+def bisect_job(row: dict) -> dict | None:
+    """What `tperf bisect worker` needs to rerun this series' one scenario: its harness config and the bench arguments
+    without the suite's own scenario selection (--config-file, --level). None for what the bisect cannot rerun."""
+    if row.get("tp") or (row.get("scenario") or "").startswith("serve:") or not row.get("bench_args"):
+        return None
+    args, skip = [], False
+    for token in row["bench_args"].split():
+        if skip:
+            skip = False
+        elif token in ("--config-file", "--level"):
+            skip = True
+        else:
+            args.append(token)
+    config: dict = {"attn_implementation": row.get("attn_implementation")}
+    if row.get("compile_mode") is not None:
+        config["compile_kwargs"] = {"mode": row["compile_mode"]}
+    if row.get("continuous_batching"):
+        config["continuous_batching"] = True
+    if row.get("kernelize"):
+        config["kernelize"] = True
+    return {"bench_args": " ".join(args), "config": config}
 
 
 def every_day(series: list[dict]) -> list[dict]:
