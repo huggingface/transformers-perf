@@ -60,6 +60,10 @@ COMMANDS: dict[str, dict[str, tuple[str, str]]] = {
         "": ("tperf.bisect.run", "find the commit of main that changed a scenario: tperf bisect <good> <bad>"),
         "worker": ("tperf.bisect.worker", "run the bisect jobs queued from the dashboard's benchmarks page"),
     },
+    "auth": {"": ("tperf.remote.auth", "sign in to the transformers-ci dashboard: tperf auth login|status|logout")},
+    "bench": {
+        "": ("tperf.remote.bench", "benchmark a transformers PR against main on the bench host: tperf bench <PR>")
+    },
     "deploy": {
         "": ("tperf.host.deploy", "copy the package (harness included) and scenarios to the host, install the timer")
     },
