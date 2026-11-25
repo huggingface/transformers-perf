@@ -116,7 +116,9 @@ def test_pr_bench_runs_each_scenario_against_the_merge_base(monkeypatch):
 
     monkeypatch.setattr(bisect_run, "run_ab", run_ab)
     monkeypatch.delenv("MODEL", raising=False)
+    monkeypatch.delenv("GPUS", raising=False)
     assert worker.poll_once() is True
+    assert os.environ.pop("GPUS") == "1 5"
     assert "+refs/pull/123/head:refs/ab/pr-123" in remote[0]
     assert seen == [("m" * 40, "e" * 40, 3, "google/gemma-3-1b-it", "-w 5"),
                     ("m" * 40, "e" * 40, 3, "meta-llama/Llama-2-7b-hf", None)]  # fmt: skip

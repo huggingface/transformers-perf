@@ -161,6 +161,7 @@ class scenario_env:
 
 
 def run(job: dict) -> None:
+    os.environ.setdefault("GPUS", "1 5")  # every job: not the daily suites' GPUs 0 and 4
     if job.get("kind") == "pr":
         try:
             run_pr(job)
