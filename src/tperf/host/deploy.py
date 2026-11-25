@@ -3,6 +3,7 @@ benchmark on the host.
 
 Usage: tperf deploy            # copy tooling, install bench-daily.timer (03:00 UTC)
        tperf deploy --run-now  # same, then start a run immediately (in the background)
+       tperf deploy --bisect-worker  # same, plus bench-bisect-worker.service (`tperf bisect worker`)
 
 On the host: the tperf package in /opt/bench/src/tperf (run with PYTHONPATH=/opt/bench/src), with the harness in
 /opt/bench/src/tperf/harness (its version in VERSION there), the scenarios in /opt/bench/daily/scenarios. Only this
@@ -42,6 +43,11 @@ INSTALL_OPTIONS = ["TF_COMMIT"]
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--run-now", action="store_true", help="start a run right after deploying")
+    parser.add_argument(
+        "--bisect-worker",
+        action="store_true",
+        help="also run `tperf bisect worker` as a service (needs ~/.config/tperf/bisect-token on the host)",
+    )
     args = parser.parse_args(argv)
 
     # /opt/bench/harness: the harness's old place, before it moved into the package
@@ -64,9 +70,34 @@ def main(argv: list[str] | None = None) -> None:
         "&& sudo systemctl daemon-reload && sudo systemctl enable --now bench-daily.timer >/dev/null "
         "&& systemctl list-timers bench-daily.timer --no-pager | head -2"
     )
+    if args.bisect_worker:
+        install_bisect_worker()
     if args.run_now:
         ssh(["sudo", "systemctl", "start", "--no-block", "bench-daily.service"])
         print(f"started: ssh {HOST} journalctl -u bench-daily -f")
+
+
+def install_bisect_worker() -> None:
+    """bench-bisect-worker.service, and the ssh key it uses to reach this host as HOST=ubuntu@localhost."""
+    ssh("test -s ~/.config/tperf/bisect-token || { echo 'missing ~/.config/tperf/bisect-token' >&2; exit 1; }")
+    ssh(
+        "mkdir -p /opt/bench/bisect && chmod 700 ~/.ssh "
+        "&& { test -f ~/.ssh/id_bisect || ssh-keygen -q -t ed25519 -N '' -C bisect-worker -f ~/.ssh/id_bisect; } "
+        '&& { grep -qF "$(cat ~/.ssh/id_bisect.pub)" ~/.ssh/authorized_keys '
+        "|| cat ~/.ssh/id_bisect.pub >> ~/.ssh/authorized_keys; } "
+        "&& { grep -q '^Host localhost' ~/.ssh/config 2>/dev/null "
+        "|| printf 'Host localhost\\n  IdentityFile ~/.ssh/id_bisect\\n  StrictHostKeyChecking accept-new\\n' >> ~/.ssh/config; } "
+        "&& chmod 600 ~/.ssh/config && ssh -o BatchMode=yes localhost true"
+    )
+    scp_to([PKG_SRC / "tperf/bisect/bench-bisect-worker.service"], "/tmp/")
+    ssh(
+        "sudo install -m 644 /tmp/bench-bisect-worker.service /etc/systemd/system/ "
+        "&& rm /tmp/bench-bisect-worker.service "
+        "&& sudo systemctl daemon-reload && sudo systemctl enable bench-bisect-worker.service >/dev/null "
+        "&& sudo systemctl restart bench-bisect-worker.service "
+        "&& systemctl is-active bench-bisect-worker.service"
+    )
+    print(f"bisect worker: ssh {HOST} journalctl -u bench-bisect-worker -f")
 
 
 def pipe_as_root(script: str, options: list[str], args: list[str]) -> None:

@@ -1,0 +1,20 @@
+[Unit]
+Description=Bisect jobs queued from the dashboard's benchmarks page (tperf bisect worker)
+Wants=network-online.target nvidia-persistenced.service
+After=network-online.target nvidia-persistenced.service bench-tuning.service
+
+[Service]
+User=ubuntu
+Environment=PYTHONPATH=/opt/bench/src
+# tperf ab reaches the GPUs over ssh, here to this host itself (a key of its own, see `tperf deploy --bisect-worker`)
+Environment=HOST=ubuntu@localhost
+Environment=BISECT_TOKEN_FILE=/home/ubuntu/.config/tperf/bisect-token
+EnvironmentFile=-/opt/bench/tperf.env
+# results/bisect-*/ and the ab-* directories land here
+WorkingDirectory=/opt/bench/bisect
+ExecStart=/usr/bin/python3 -m tperf.bisect.worker
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target

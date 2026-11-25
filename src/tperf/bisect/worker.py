@@ -132,9 +132,9 @@ def poll_once() -> bool:
     if quiet_now() or not daily_lock_free():
         return False
     status, job = call("GET", "/benchmarks/bisect/next")
-    if status == 204 or not job:
+    if status == 204:
         return False
-    if status != 200:
+    if status != 200 or not job:
         log(f"GET /benchmarks/bisect/next answered {status}")
         return False
     run(job)
