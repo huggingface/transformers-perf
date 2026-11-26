@@ -73,7 +73,9 @@ SUITES = {
 
 # serve suite name -> (gpu, model, scenario name in scenarios/serve-multiturn.jsonl)
 SERVE_SUITES = {
-    "serve-gemma3-1b": (4, "google/gemma-3-1b-it", "chat"),
+    # gemma-3-1b-it cannot be served: its tokenizer_config names Gemma3Processor, which needs an
+    # image processor the text-only repo does not ship, so `transformers serve` exits at load.
+    "serve-qwen3-1.7b": (4, "Qwen/Qwen3-1.7B", "chat"),
 }
 
 os.environ.update(
