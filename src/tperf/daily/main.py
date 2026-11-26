@@ -17,8 +17,10 @@ the node's cores), published with label daily-<suite> like the GPU suites.
 Then the "processors" suite: tperf.processors.bench on scenarios/processors.jsonl, RUNS times, pinned to NCORES cores of
 node 0 and GPU 0 (free once the GPU suites are done), published to processors/ with label daily-processors.
 Then, once nothing timed runs any more, one memory profile per GPU suite (tperf.memory.profile: the suite's model,
-shapes and first scenario, every allocation recorded), published to memory/<month>/<group>/ in the dataset and linked
-from the dashboard's daily points. MEMORY_PROFILE=0 skips it; a failed profile is logged and fails nothing.
+shapes and first scenario, every allocation recorded), then one time profile per serve suite (its conversation again
+with py-spy on the server, tperf.serve.bench --profile -> tperf.serve.report), published to memory/<month>/<group>/ in
+the dataset and linked from the dashboard's daily points. MEMORY_PROFILE=0 skips them; a failed profile is logged and
+fails nothing.
 Skipped (exit 0) if a benchmark is already running on the host.
 Progress, for `tperf bisect worker` (which starts this run at 03:00 UTC and shows it in the dashboard's Bench queue):
 a line "stages <n>" once the stages are known, then "stage <ok|failed>: <label>" as each one ends.
@@ -237,6 +239,39 @@ class Daily:
             if not last_line([*module("memory.publish"), d, "--repo", PUBLISH_REPO, "--group", group], f"{s}: "):
                 log(f"warning: publishing the memory profile of {s} failed")
 
+    def run_serve_profiles(self, suites: list[str]) -> None:
+        """One py-spy time profile per serve suite (its conversation again, with tperf.serve.bench --profile on the
+        server, as a tperf.serve.report), one after the other on the suite's GPU, then published. Informative only."""
+        scen = D / "scenarios/serve-multiturn.jsonl"
+        names = [json.loads(line).get("name") for line in scen.read_text().splitlines() if line.startswith("{")]
+        for s in suites:
+            gpu, model, name = SERVE_SUITES[s]
+            if name not in names:
+                continue
+            node = GPU_NUMA_MAP[gpu]
+            d = self.out / s / "profile"
+            d.mkdir(parents=True, exist_ok=True)
+            env = dict(
+                os.environ, PYTHONPATH=f"{SRC}:{self.w}/src", TRANSFORMERS_DIR=self.w, HF_HUB_OFFLINE="1",
+                OMP_NUM_THREADS=str(NCORES), CUDA_VISIBLE_DEVICES=str(gpu),
+            )  # fmt: skip
+            with open(self.out / s / "profile.log", "w") as logf:
+                io = dict(cwd="/tmp", env=env, stdout=logf, stderr=subprocess.STDOUT)
+                rc = subprocess.run(
+                    argv("numactl", f"--physcpubind={cpus_for(node)}", f"--membind={node}",
+                     *module("serve.bench"), "--model-id", model, "--out", d / "serve", "--python", PY,
+                     "--commit", self.sha, "--config-file", scen, "--scenario-index", names.index(name), "--profile"),
+                    **io,
+                ).returncode  # fmt: skip
+                if not rc:
+                    rc = subprocess.run(argv(*module("serve.report"), d / "serve", d), **io).returncode
+            if rc or not (d / "report.html").exists():
+                log(f"warning: serve profile of {s} failed, see {self.out}/{s}/profile.log")
+                continue
+            group = f"{self.stamp}-{LABEL_PREFIX}-{s}"
+            if not last_line([*module("memory.publish"), d, "--repo", PUBLISH_REPO, "--group", group], f"{s}: "):
+                log(f"warning: publishing the serve profile of {s} failed")
+
     def run_serve(self, s: str) -> bool:
         """All runs of one serve suite (tperf.serve.bench on the worktree of main), then publish them."""
         gpu, model, name = SERVE_SUITES[s]
@@ -347,7 +382,7 @@ for m in {{s['model'] for s in scenarios if s.get('stage', 'processor') != 'proc
             subprocess.run(["/opt/bench/tbv2-venv/bin/hf", "download", model], check=True, stdout=subprocess.DEVNULL)
 
         stages = (RUNS if gpu_suites else 0) + RUNS * len(serve_suites) + (RUNS if "processors" in suites else 0)
-        stages += 1 + (1 if MEMORY_PROFILE and gpu_suites else 0)  # publishing, memory profiles
+        stages += 1 + (1 if MEMORY_PROFILE and (gpu_suites or serve_suites) else 0)  # publishing, profiles
         print(f"stages {stages}", flush=True)
         ok = self.run_gpu_suites(gpu_suites) if gpu_suites else True
         for s in serve_suites:
@@ -364,9 +399,12 @@ for m in {{s['model'] for s in scenarios if s.get('stage', 'processor') != 'proc
                 log(f"error: publishing {s} failed")
                 ok = published = False
         self.stage("publish to the dataset", published)
-        if MEMORY_PROFILE and gpu_suites:
+        if MEMORY_PROFILE and (gpu_suites or serve_suites):
             log("memory profiles")
-            self.run_memory_profiles(gpu_suites)
+            if gpu_suites:
+                self.run_memory_profiles(gpu_suites)
+            # After the GPU suites' profiles: a serve suite can share their GPU
+            self.run_serve_profiles(serve_suites)
             self.stage("memory profiles", True)
         if DASHBOARD_SPACE:
             dash = [*module("dashboard.build"), "--dataset", PUBLISH_REPO,
