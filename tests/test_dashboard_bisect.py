@@ -62,4 +62,4 @@ def test_the_daily_serve_suite_names_a_scenario_that_exists(monkeypatch):
     names = [json.loads(line)["name"] for line in Path("scenarios/serve-multiturn.jsonl").read_text().splitlines()
              if line.startswith("{")]  # fmt: skip
     for gpu, model, name in daily.SERVE_SUITES.values():
-        assert name in names and gpu not in {g for g, *_ in daily.SUITES.values()} - {4}
+        assert name in names and gpu not in {g for g, *_ in daily.SUITES.values()} - {"4"}

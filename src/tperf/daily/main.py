@@ -62,23 +62,40 @@ GPU_NUMA_MAP = [int(n) for n in (os.environ.get("GPU_NUMA_MAP") or "0 0 0 0 1 1 
 MEMORY_PROFILE = os.environ.get("MEMORY_PROFILE", "1") != "0"
 PROC_PYTHONPATH_EXTRA = "/opt/bench/proc-deps"  # torchvision and Pillow, not in the tbv2-venv
 
-# suite name -> (gpu, model, bench args, scenarios file or None for --level 1)
+# suite name -> (GPU, or GPU group for tensor parallelism, model, bench args, scenarios file or None for --level 1).
+# The single-GPU suites run at the same time; a suite with a GPU group (TP) runs alone after them.
 SUITES = {
-    "llama2-7b": (0, "meta-llama/Llama-2-7b-hf", "-w 5 -i 10 -b 1 -s 128 -n 64", None),
+    "llama2-7b": ("0", "meta-llama/Llama-2-7b-hf", "-w 5 -i 10 -b 1 -s 128 -n 64", None),
     "gemma3-1b-sliding": (
-        4,
+        "4",
         "google/gemma-3-1b-it",
         "-w 5 -i 6 -b 1 -s 448 -n 128",
         D / "scenarios/sliding-window.jsonl",
     ),
+    # Tensor parallel decode: eager (an all-reduce launched from Python per layer) and compiled (CUDA graphs)
+    "llama2-7b-tp2": ("0,1", "meta-llama/Llama-2-7b-hf", "-w 5 -i 10 -b 1 -s 128 -n 64", D / "scenarios/tp.jsonl"),
 }
+NCCL_ENV = {"NCCL_CUMEM_HOST_ENABLE": "0"}  # see `tperf baselines p2p`
 
 # serve suite name -> (gpu, model, scenario name in scenarios/serve-multiturn.jsonl)
 SERVE_SUITES = {
     # gemma-3-1b-it cannot be served: its tokenizer_config names Gemma3Processor, which needs an
     # image processor the text-only repo does not ship, so `transformers serve` exits at load.
-    "serve-qwen3-1.7b": (4, "Qwen/Qwen3-1.7B", "chat"),
+    "serve-qwen3-1.7b": ("4", "Qwen/Qwen3-1.7B", "chat"),
 }
+
+
+def box_gpus(spec: str) -> None:
+    """SUITE_GPUS="<suite>=<gpu or group> ...": this box's GPUs for those suites (the defaults are an 8-GPU box's)."""
+    for item in spec.split():
+        name, _, gpus = item.partition("=")
+        table = SUITES if name in SUITES else SERVE_SUITES if name in SERVE_SUITES else None
+        if table is None or not gpus:
+            raise SystemExit(f"SUITE_GPUS: unknown suite or no GPU in {item!r}")
+        table[name] = (gpus, *table[name][1:])
+
+
+box_gpus(os.environ.get("SUITE_GPUS", ""))
 
 os.environ.update(
     PYTHONPATH=SRC,  # every child below runs tperf modules with `-m`
@@ -104,8 +121,10 @@ def tune_host() -> None:
     )
 
 
-def cpus_for(node: int) -> str:
-    """First hardware thread of NCORES cores on a NUMA node, skipping its first core (housekeeping)."""
+def cpus_for(node: int, slot: int = 0, cores: int = 0) -> str:
+    """First hardware thread of `cores` (default NCORES) cores on a NUMA node, skipping its first core (housekeeping).
+    Runs at the same time on one node take slots 0, 1, ...: each its own cores."""
+    cores = cores or NCORES
     out = subprocess.run(["lscpu", "-p=CPU,CORE,NODE"], check=True, text=True, capture_output=True).stdout
     seen, cpus = set(), []
     for line in out.splitlines():
@@ -115,7 +134,25 @@ def cpus_for(node: int) -> str:
         if int(n) == node and core not in seen:
             seen.add(core)
             cpus.append(cpu)
-    return ",".join(cpus[1 : NCORES + 1])
+    picked = cpus[1 + slot * cores : 1 + (slot + 1) * cores]
+    if len(picked) < cores:
+        raise SystemExit(f"NUMA node {node} has {len(cpus)} cores: not enough for slot {slot} of {cores}")
+    return ",".join(picked)
+
+
+def node_of(gpus: str) -> int:
+    return GPU_NUMA_MAP[int(gpus.split(",")[0])]
+
+
+def slots(suites: list[str], table: dict) -> dict[str, int]:
+    """Each suite's slot on its GPU's NUMA node, for suites that run at the same time."""
+    taken: dict[int, int] = {}
+    out = {}
+    for s in suites:
+        node = node_of(table[s][0])
+        out[s] = taken.get(node, 0)
+        taken[node] = out[s] + 1
+    return out
 
 
 def argv(*args: object) -> list[str]:
@@ -147,12 +184,13 @@ class Daily:
     def stage(self, label: str, ok: bool) -> None:
         print(f"stage {'ok' if ok else 'failed'}: {label}", flush=True)
 
-    def start_suite(self, s: str, i: int) -> tuple[subprocess.Popen | None, str]:
+    def start_suite(self, s: str, i: int, slot: int = 0) -> tuple[subprocess.Popen | None, str]:
         """Write the manifest and launch one run of a suite; returns its process (None if the manifest failed)."""
-        gpu, model, args, scen = SUITES[s]
+        group, model, args, scen = SUITES[s]
         args = ARGS or args
-        node = GPU_NUMA_MAP[gpu]
-        cpus = cpus_for(node)
+        gpu, tp = int(group.split(",")[0]), group.count(",") + 1
+        node = node_of(group)
+        cpus = cpus_for(node, slot, NCORES * tp)
         d = self.out / s / f"run{i}"
         cc = f"/mnt/cache/compile-cache/daily-{self.stamp}-{s}-run{i}"
         scen_arg = ["--config-file", str(scen)] if scen else ["--level", "1"]
@@ -180,24 +218,37 @@ class Daily:
         if manifest.returncode:
             logf.close()
             return None, cc
-        io["env"] = dict(env, CUDA_VISIBLE_DEVICES=str(gpu))
+        io["env"] = dict(env, CUDA_VISIBLE_DEVICES=group)
+        launch, tp_args = [PY], []
+        if tp > 1:
+            # --standalone picks a free rendezvous port
+            launch = [PY, "-m", "torch.distributed.run", "--standalone", "--nproc-per-node", tp]
+            tp_args = ["--enable-tp"]
+            io["env"].update(NCCL_ENV, OMP_NUM_THREADS=str(NCORES))
         proc = subprocess.Popen(
             argv("numactl", f"--physcpubind={cpus}", f"--membind={node}",
              *module("common.noise_probe"), "--cpus", cpus, "--gpu", gpu, "--out", d / "probe.json", "--",
-             *module("harness.run_benchmarks"), "--output-dir", d, "--model-id", model, *shlex.split(args), *scen_arg,
-             "--no-gpu-monitoring", "--commit-id", self.sha, "--log-level", "WARNING"),
+             *launch, "-m", "tperf.harness.run_benchmarks", "--output-dir", d, "--model-id", model, *shlex.split(args),
+             *scen_arg, *tp_args, "--no-gpu-monitoring", "--commit-id", self.sha, "--log-level", "WARNING"),
             **io,
         )  # fmt: skip
         logf.close()  # the child has its own copy
         return proc, cc
 
     def run_gpu_suites(self, suites: list[str]) -> bool:
+        """The single-GPU suites at the same time (each on its own cores), then each TP suite alone, RUNS times."""
+        together = [s for s in suites if "," not in SUITES[s][0]]
+        batches = ([together] if together else []) + [[s] for s in suites if s not in together]
+        return all([self.run_batch(b) for b in batches])
+
+    def run_batch(self, suites: list[str]) -> bool:
         ok = True
+        slot = slots(suites, SUITES)
         for i in range(1, RUNS + 1):
             log(f"run {i}/{RUNS}: {' '.join(suites)}")
             tune_host()
             # Manifests first, then all suites at once, so no manifest is taken while another suite runs
-            started = [(s, *self.start_suite(s, i)) for s in suites]
+            started = [(s, *self.start_suite(s, i, slot[s])) for s in suites]
             run_ok = True
             for s, proc, cc in started:
                 if proc is None or proc.wait():
@@ -210,9 +261,11 @@ class Daily:
     def run_memory_profiles(self, suites: list[str]) -> None:
         """One memory profile per suite, each on its suite's GPU, all at once, then published. Informative only."""
         procs = []
+        suites = [s for s in suites if "," not in SUITES[s][0]]  # no TP profile
+        slot = slots(suites, SUITES)
         for s in suites:
             gpu, model, args, scen = SUITES[s]
-            node = GPU_NUMA_MAP[gpu]
+            node = node_of(gpu)
             shapes = shlex.split(ARGS or args)
             # The suite's shapes; its warmup and iteration counts are for timing, not for this
             keep = [
@@ -225,7 +278,8 @@ class Daily:
             env = dict(os.environ, PYTHONPATH=f"{SRC}:{self.w}/src", CUDA_VISIBLE_DEVICES=str(gpu))
             with open(self.out / s / "memory.log", "w") as logf:
                 proc = subprocess.Popen(
-                    argv("numactl", f"--physcpubind={cpus_for(node)}", f"--membind={node}", *module("memory.profile"),
+                    argv("numactl", f"--physcpubind={cpus_for(node, slot[s])}", f"--membind={node}",
+                     *module("memory.profile"),
                      "--model-id", model, "--out", d, "--no-keep-snapshot", *keep,
                      *(["--config-file", scen, "--scenario-index", 0] if scen else [])),
                     cwd="/tmp", env=env, stdout=logf, stderr=subprocess.STDOUT,
@@ -248,7 +302,7 @@ class Daily:
             gpu, model, name = SERVE_SUITES[s]
             if name not in names:
                 continue
-            node = GPU_NUMA_MAP[gpu]
+            node = node_of(gpu)
             d = self.out / s / "profile"
             d.mkdir(parents=True, exist_ok=True)
             env = dict(
@@ -275,7 +329,7 @@ class Daily:
     def run_serve(self, s: str) -> bool:
         """All runs of one serve suite (tperf.serve.bench on the worktree of main), then publish them."""
         gpu, model, name = SERVE_SUITES[s]
-        node = GPU_NUMA_MAP[gpu]
+        node = node_of(gpu)
         cpus = cpus_for(node)
         scen = D / "scenarios/serve-multiturn.jsonl"
         names = [json.loads(line).get("name") for line in scen.read_text().splitlines() if line.startswith("{")]
@@ -381,7 +435,9 @@ for m in {{s['model'] for s in scenarios if s.get('stage', 'processor') != 'proc
         for model in dict.fromkeys([*(SUITES[s][1] for s in gpu_suites), *(SERVE_SUITES[s][1] for s in serve_suites)]):
             subprocess.run(["/opt/bench/tbv2-venv/bin/hf", "download", model], check=True, stdout=subprocess.DEVNULL)
 
-        stages = (RUNS if gpu_suites else 0) + RUNS * len(serve_suites) + (RUNS if "processors" in suites else 0)
+        together = any("," not in SUITES[s][0] for s in gpu_suites)
+        batches = int(together) + sum("," in SUITES[s][0] for s in gpu_suites)
+        stages = RUNS * batches + RUNS * len(serve_suites) + (RUNS if "processors" in suites else 0)
         stages += 1 + (1 if MEMORY_PROFILE and (gpu_suites or serve_suites) else 0)  # publishing, profiles
         print(f"stages {stages}", flush=True)
         ok = self.run_gpu_suites(gpu_suites) if gpu_suites else True

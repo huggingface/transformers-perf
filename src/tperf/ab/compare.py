@@ -4,7 +4,9 @@
 
 Each round ran base and head at the same time on two GPUs, swapping GPUs every round. For every scenario and metric,
 the per-round log ratio head/base is fitted as `change + gpu_effect * orientation`: `change` is the PR's effect with
-the GPU difference taken out, with a 95% confidence interval from the spread between rounds (t distribution).
+the GPU difference taken out, with a 95% confidence interval from the spread between rounds (t distribution). An A/B on
+one GPU ran the sides in turn, base first in odd rounds: there the orientation is which side ran first, and the fitted
+`gpu` column is the run-order effect.
 
 Verdict per metric, with T the threshold (%):
   REGRESSION / improvement  the whole interval is worse / better than T
@@ -113,7 +115,10 @@ def analyze(rows: list[dict], threshold: float = 1.0) -> dict:
                 if _num(b) and _num(h) and b > 0 and h > 0:  # ratios of positive values only
                     sign = -1 if higher_is_better else 1  # positive = head worse
                     y.append(sign * math.log(h / b))
-                    o.append(1.0 if sides["head"]["gpu_index"] == gpus[-1] else -1.0)
+                    if len(gpus) == 1:  # sides in turn on one GPU: head ran first in even rounds
+                        o.append(1.0 if sides["head"]["ab_round"] % 2 == 0 else -1.0)
+                    else:
+                        o.append(1.0 if sides["head"]["gpu_index"] == gpus[-1] else -1.0)
             if not y:
                 continue
             change, half, gpu = fit(y, o)

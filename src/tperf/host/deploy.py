@@ -5,6 +5,14 @@ Usage: tperf deploy            # copy tooling, install bench-daily.timer (03:00 
        tperf deploy --run-now  # same, then start a run immediately (in the background)
        tperf deploy --bisect-worker [--box NAME]  # same, plus bench-bisect-worker.service (`tperf bisect worker`),
                                                   # which then also runs the daily benchmark (the timer is turned off)
+       tperf deploy --bisect-worker --no-daily    # a worker that only takes queued jobs: no daily benchmark here
+
+This box's layout, from your environment when set, goes to /opt/bench/tperf.env with the publishing settings, so the
+daily run, the worker and its A/Bs all read it: GPU_NUMA_MAP, SUITE_GPUS (the daily suites' GPUs, see
+tperf.daily.main), GPUS (the worker's A/B GPUs; one GPU runs the sides in turn), NCORES. A redeploy without them
+keeps the ones already there. E.g. a 4-GPU, one-node box:
+  GPU_NUMA_MAP="0 0 0 0" SUITE_GPUS="gemma3-1b-sliding=1 serve-qwen3-1.7b=1 llama2-7b-tp2=2,3" GPUS="2 3" \
+    tperf deploy --bisect-worker --box g5-12xl
 
 On the host: the tperf package in /opt/bench/src/tperf (run with PYTHONPATH=/opt/bench/src), with the harness in
 /opt/bench/src/tperf/harness (its version in VERSION there), the scenarios in /opt/bench/daily/scenarios. Only this
@@ -32,6 +40,7 @@ from tperf.common.benchlib import (
     require_host,
     scp_to,
     ssh,
+    ssh_out,
     stamp,
 )
 
@@ -39,6 +48,7 @@ from tperf.common.benchlib import (
 # Options of tperf/host/prepare.py and tperf/host/install.py, passed on to the host when set here
 TUNE_OPTIONS = ["KEEP_SSM", "KEEP_CSTATES", "NVIDIA_DRIVER", "CACHE_MOUNT", "GPU_NUMA_MAP", "GPU_SM_CLOCK"]
 INSTALL_OPTIONS = ["TF_COMMIT"]
+BOX_OPTIONS = ["GPU_NUMA_MAP", "SUITE_GPUS", "GPUS", "NCORES"]  # this box's layout, kept in /opt/bench/tperf.env
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -53,6 +63,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--box", default="", help="this box's name in the dashboard's box list (for the worker's logs)"
     )
+    parser.add_argument(
+        "--no-daily",
+        action="store_true",
+        help="no daily benchmark on this box (timer off, worker without DAILY_AT_UTC)",
+    )
     args = parser.parse_args(argv)
 
     # /opt/bench/harness: the harness's old place, before it moved into the package
@@ -63,8 +78,16 @@ def main(argv: list[str] | None = None) -> None:
     version = push_package(staging)
     ssh(f"rm -rf {REMOTE_SRC}/tperf && mv -T {staging}/tperf {REMOTE_SRC}/tperf && rmdir {staging}")
     print(f"harness {version}")
-    # Where the daily run publishes, from tperf.toml (read by bench-daily.service)
-    env = f"PUBLISH_REPO={DATASET}\nDASHBOARD_SPACE={DASHBOARD_SPACE}\n"
+    # Where the daily run publishes, from tperf.toml, and this box's layout (read by both services)
+    kept = {}
+    for line in ssh_out("cat /opt/bench/tperf.env 2>/dev/null || true").splitlines():
+        k, _, v = line.partition("=")
+        if k in BOX_OPTIONS:
+            kept[k] = v
+    kept.update({k: shlex.quote(os.environ[k]) for k in BOX_OPTIONS if k in os.environ})
+    env = f"PUBLISH_REPO={DATASET}\nDASHBOARD_SPACE={DASHBOARD_SPACE}\n" + "".join(
+        f"{k}={v}\n" for k, v in kept.items()
+    )
     subprocess.run([*SSH, require_host(), "cat >/opt/bench/tperf.env"], input=env, text=True, check=True)
     scp_to(sorted((ROOT / "scenarios").glob("*.jsonl")), "/opt/bench/daily/scenarios/")
     units = PKG_SRC / "tperf/daily"
@@ -74,23 +97,27 @@ def main(argv: list[str] | None = None) -> None:
         args.bisect_worker
         or ssh("systemctl is-enabled --quiet bench-bisect-worker.service", check=False).returncode == 0
     )
-    timer = "disable --now" if worker_owns_daily else "enable --now"
+    timer = "disable --now" if worker_owns_daily or args.no_daily else "enable --now"
     ssh(
         "sudo install -m 644 /tmp/bench-daily.service /tmp/bench-daily.timer /etc/systemd/system/ "
         "&& rm /tmp/bench-daily.service /tmp/bench-daily.timer "
         f"&& sudo systemctl daemon-reload && sudo systemctl {timer} bench-daily.timer >/dev/null 2>&1; "
         "systemctl list-timers bench-daily.timer --no-pager | head -2"
     )
-    if worker_owns_daily:
+    if args.no_daily:
+        print("daily benchmark: none on this box")
+    elif worker_owns_daily:
         print("daily benchmark: run by bench-bisect-worker (bench-daily.timer off)")
+    for k, v in kept.items():
+        print(f"{k}={v}")
     if args.bisect_worker:
-        install_bisect_worker(args.box)
+        install_bisect_worker(args.box, daily=not args.no_daily)
     if args.run_now:
         ssh(["sudo", "systemctl", "start", "--no-block", "bench-daily.service"])
         print(f"started: ssh {HOST} journalctl -u bench-daily -f")
 
 
-def install_bisect_worker(box: str = "") -> None:
+def install_bisect_worker(box: str = "", daily: bool = True) -> None:
     """bench-bisect-worker.service, and the ssh key it uses to reach this host as HOST=ubuntu@localhost."""
     ssh("test -s ~/.config/tperf/bisect-token || { echo 'missing ~/.config/tperf/bisect-token' >&2; exit 1; }")
     ssh(
@@ -104,7 +131,8 @@ def install_bisect_worker(box: str = "") -> None:
     )
     scp_to([PKG_SRC / "tperf/bisect/bench-bisect-worker.service"], "/tmp/")
     # this box's settings, beside the packaged unit: its name, and the daily run's time
-    dropin = f"[Service]\nEnvironment=DAILY_AT_UTC=03:00\nEnvironment=BISECT_BOX={box or 'default'}\n"
+    dropin = "[Service]\n" + ("Environment=DAILY_AT_UTC=03:00\n" if daily else "")
+    dropin += f"Environment=BISECT_BOX={box or 'default'}\n"
     subprocess.run(
         [*SSH, require_host(), ("sudo mkdir -p /etc/systemd/system/bench-bisect-worker.service.d "
                                 "&& sudo tee /etc/systemd/system/bench-bisect-worker.service.d/box.conf >/dev/null")],

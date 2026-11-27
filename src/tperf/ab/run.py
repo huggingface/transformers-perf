@@ -29,7 +29,10 @@ Environment:
   HEAD_EXTRA_PATCHES  patches applied to the head side's harness only (a separate copy of the package), to A/B a
                 change to the benchmark itself; with `main` as the PR, both sides run the main tip. Patch paths
                 start with src/tperf/harness/
-  GPUS="0 4"    the two GPUs used, one per NUMA node; NCORES=8 cores each on the GPU's node
+  GPUS="0 4"    the two GPUs used, one per NUMA node; NCORES=8 cores each on the GPU's node. One GPU (GPUS="0", a
+                one-GPU box): the sides run one after the other on it, base first in odd rounds and head first in even
+                ones, and `tperf ab compare` fits the order effect out where it would fit the GPU difference. No
+                profiles in that mode
   TP=1          tensor parallel size: each side runs under torchrun with --enable-tp on TP GPUs of one NUMA node
                 (GPUS defaults to "0,1 4,5" for TP=2, "0,1,2,3 4,5,6,7" for TP=4), NCORES cores per rank
   NCCL_ENV="NCCL_CUMEM_HOST_ENABLE=0"   for TP > 1, see `tperf baselines p2p`
@@ -95,7 +98,7 @@ def profile_args(bench_args: str, scenarios: str, ab: str) -> list[str]:
 def side_cpus(gpus: list[str], node_of: dict[str, int], count: int) -> dict[str, str]:
     """CPUs for each side's GPU group, `count` cores each. Sides on the same NUMA node (a one-node host) split twice
     as many of its cores, so they never share one."""
-    if node_of[gpus[0]] != node_of[gpus[1]]:
+    if gpus[0] == gpus[1] or node_of[gpus[0]] != node_of[gpus[1]]:  # one GPU, run in turn; or two nodes
         return {g: cpus_for(node_of[g], count) for g in gpus}
     both = cpus_for(node_of[gpus[0]], 2 * count).split(",")
     return {gpus[0]: ",".join(both[:count]), gpus[1]: ",".join(both[count:])}
@@ -178,8 +181,11 @@ def main(argv: list[str] | None = None) -> None:
         serve_index = scenario_index(Path(serve_scenarios), serve)
         bench_args = shlex.join(["serve", serve, *serve_extra])
 
-    if len(gpus) != 2:
-        die("GPUS needs two GPU groups (one GPU each without TP)")
+    if len(gpus) not in (1, 2):
+        die("GPUS needs two GPU groups (one GPU each without TP), or one to run the sides in turn")
+    sequential = len(gpus) == 1
+    if sequential:
+        gpus = gpus * 2
     for group in gpus:
         ids = [int(g) for g in group.split(",")]
         if len(ids) != tp:
@@ -187,7 +193,7 @@ def main(argv: list[str] | None = None) -> None:
         if len({GPU_NUMA_MAP[g] for g in ids}) != 1:
             die(f"GPU group {group} spans NUMA nodes (NCCL's GPU->host writes drop 4x)")
     node_of = {group: GPU_NUMA_MAP[int(group.split(",")[0])] for group in gpus}
-    if node_of[gpus[0]] == node_of[gpus[1]]:
+    if not sequential and node_of[gpus[0]] == node_of[gpus[1]]:
         print(f"warning: GPUs {' '.join(gpus)} are on the same NUMA node; the sides get separate cores but share "
               "memory bandwidth",
               file=sys.stderr)  # fmt: skip
@@ -366,19 +372,29 @@ def main(argv: list[str] | None = None) -> None:
             )
 
         for r in range(1, rounds + 1):
-            # Alternate which side gets which GPU
+            # Alternate which side gets which GPU, or with one GPU which side runs first
             gb, gh = (gpus[0], gpus[1]) if r % 2 else (gpus[1], gpus[0])
-            log(f"Round {r}/{rounds}: base on GPU {gb}, head on GPU {gh}" + (f" (TP{tp})" if tp > 1 else ""))
+            tp_txt = f" (TP{tp})" if tp > 1 else ""
             tune_host("apply")
-            procs = [subprocess.Popen([*SSH, HOST, side_cmd(side, g, r)]) for side, g in (("base", gb), ("head", gh))]
-            if any([p.wait() for p in procs]):
+            if sequential:
+                order = ("base", "head") if r % 2 else ("head", "base")
+                log(f"Round {r}/{rounds}: {order[0]} then {order[1]} on GPU {gpus[0]}{tp_txt}")
+                failed = any(subprocess.run([*SSH, HOST, side_cmd(side, gpus[0], r)]).returncode for side in order)
+            else:
+                log(f"Round {r}/{rounds}: base on GPU {gb}, head on GPU {gh}{tp_txt}")
+                sides = (("base", gb), ("head", gh))
+                procs = [subprocess.Popen([*SSH, HOST, side_cmd(side, g, r)]) for side, g in sides]
+                failed = any([p.wait() for p in procs])
+            if failed:
                 print(f"round {r} failed, logs in {ab}/results/round{r}-*/run.log", file=sys.stderr)
                 ssh(f"tail -15 {ab}/results/round{r}-*/run.log", check=False, stdout=sys.stderr)
                 sys.exit(1)
             for side in ("base", "head"):
                 scp_from(f"{ab}/results/round{r}-{side}", out, recursive=True)
 
-        if profile and tp == 1:
+        if profile and sequential:
+            log("No profiles: one GPU runs the sides in turn")
+        elif profile and tp == 1:
             serve_args = None
             if serve:
                 serve_args = ["--config-file", f"{ab}/serve-scenarios.jsonl", "--scenario-index", serve_index,
