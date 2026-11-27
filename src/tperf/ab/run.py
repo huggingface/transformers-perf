@@ -92,6 +92,15 @@ def profile_args(bench_args: str, scenarios: str, ab: str) -> list[str]:
     return keep + (["--config-file", f"{ab}/scenarios.jsonl", "--scenario-index", "0"] if scenarios else [])
 
 
+def side_cpus(gpus: list[str], node_of: dict[str, int], count: int) -> dict[str, str]:
+    """CPUs for each side's GPU group, `count` cores each. Sides on the same NUMA node (a one-node host) split twice
+    as many of its cores, so they never share one."""
+    if node_of[gpus[0]] != node_of[gpus[1]]:
+        return {g: cpus_for(node_of[g], count) for g in gpus}
+    both = cpus_for(node_of[gpus[0]], 2 * count).split(",")
+    return {gpus[0]: ",".join(both[:count]), gpus[1]: ",".join(both[count:])}
+
+
 def profile_sides(
     ab, ab_id, model, bench_args, scenarios, gpus, node_of, ncores, head_src, publish_repo, out, shas, serve_args=None
 ) -> None:
@@ -100,13 +109,14 @@ def profile_sides(
     with py-spy on the server (tperf.serve.bench --profile), as a time report (tperf.serve.report)."""
     log("Profiling base and head (memory and time, not timed)")
     procs = []
+    cpus = side_cpus(gpus, node_of, ncores)
     for side, group in (("base", gpus[0]), ("head", gpus[1])):
         node = node_of[group]
         src = f"{ab}/src" if side == "base" else f"{ab}/{head_src}"
         d = f"{ab}/profile-{side}"
         env = {**HF_ENV, "HF_HUB_OFFLINE": 1, "PYTHONPATH": f"{src}:{ab}/{side}/src", "CUDA_VISIBLE_DEVICES": group,
                "OMP_NUM_THREADS": ncores}  # fmt: skip
-        pin = ["numactl", f"--physcpubind={cpus_for(node, ncores)}", f"--membind={node}"]
+        pin = ["numactl", f"--physcpubind={cpus[group]}", f"--membind={node}"]
         if serve_args is None:
             work = [PY, "-m", "tperf.memory.profile", "--model-id", model, "--out", d, "--no-keep-snapshot",
                     *profile_args(bench_args, scenarios, ab)]  # fmt: skip
@@ -178,7 +188,8 @@ def main(argv: list[str] | None = None) -> None:
             die(f"GPU group {group} spans NUMA nodes (NCCL's GPU->host writes drop 4x)")
     node_of = {group: GPU_NUMA_MAP[int(group.split(",")[0])] for group in gpus}
     if node_of[gpus[0]] == node_of[gpus[1]]:
-        print(f"warning: GPUs {' '.join(gpus)} are on the same NUMA node; the sides will share memory bandwidth",
+        print(f"warning: GPUs {' '.join(gpus)} are on the same NUMA node; the sides get separate cores but share "
+              "memory bandwidth",
               file=sys.stderr)  # fmt: skip
 
     # The daily main benchmark (tperf.daily.main) holds this lock while it runs
@@ -288,7 +299,7 @@ def main(argv: list[str] | None = None) -> None:
         if scenarios:
             shutil.copy(scenarios, out)
 
-        cpus = {node: cpus_for(node, ncores * tp) for node in set(node_of.values())}
+        cpus = side_cpus(gpus, node_of, ncores * tp)
         tp_args = ["--enable-tp"] if tp > 1 else []
         launch = [PY]
         if tp > 1:
@@ -326,7 +337,7 @@ def main(argv: list[str] | None = None) -> None:
             manifest = [
                 *env_args(env), *remote_module(PY, "common.record", env["PYTHONPATH"]), "manifest",
                 "--out", f"{out_dir}/manifest.json",
-                "--gpu", gpu, "--cpus", cpus[node], "--numa-node", node, "--model", model, "--bench-args", manifest_args,
+                "--gpu", gpu, "--cpus", cpus[group], "--numa-node", node, "--model", model, "--bench-args", manifest_args,
                 "--group", f"{ab_id}-r{rnd}-{side}", "--run", 1,
                 "--label", f"ab-{name}-{side}" + (f"-tp{tp}" if tp > 1 else ""),
             ]  # fmt: skip
@@ -345,9 +356,9 @@ def main(argv: list[str] | None = None) -> None:
                 ]  # fmt: skip
             run = [
                 *env_args(run_env),
-                "numactl", f"--physcpubind={cpus[node]}", f"--membind={node}",
+                "numactl", f"--physcpubind={cpus[group]}", f"--membind={node}",
                 *remote_module(PY, "common.noise_probe", env["PYTHONPATH"]),
-                "--cpus", cpus[node], "--gpu", gpu, "--out", f"{out_dir}/probe.json", "--", *workload,
+                "--cpus", cpus[group], "--gpu", gpu, "--out", f"{out_dir}/probe.json", "--", *workload,
             ]  # fmt: skip
             return (
                 f"mkdir -p {out_dir} && rm -rf {cc} && cd {out_dir} && {cmd(manifest)} && "
